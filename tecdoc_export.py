@@ -29,7 +29,7 @@ DEFAULT_COUNTRY = "de"
 DEFAULT_LANGUAGE = "de"
 
 # Test Data
-TEST_MANUFACTURER_ID = 355  # DT Spare Parts
+TEST_MANUFACTURER_ID = 355  # DT Spare Parts (Article Manufacturer)
 TEST_ARTICLE_NUMBER = "1.31809"
 
 class TecdocClient:
@@ -40,7 +40,6 @@ class TecdocClient:
             'articles': [],
             'attributes': [],
             'references': [],
-            'vehicles': [],
             'components': [],
             'article_relations': [],
             'brands': []
@@ -119,6 +118,33 @@ class TecdocClient:
         print(f"Getting enhanced article data for ID {article_id}...")
         return self.make_request(payload)
     
+    def get_comparable_numbers(self, article_number: str, generic_article_ids: List[int]) -> Dict[str, Any]:
+        """Get Comparable Numbers using genericArticleIds as per client requirements
+        
+        Args:
+            article_number: The article number to search for
+            generic_article_ids: List of generic article IDs (read from articles.csv)
+        """
+        if not generic_article_ids:
+            return {}
+        
+        payload = {
+            "getArticles": {
+                "articleCountry": DEFAULT_COUNTRY,
+                "provider": TECDOC_PROVIDER,
+                "searchQuery": article_number,
+                "searchType": 3,
+                "lang": DEFAULT_LANGUAGE,
+                "genericArticleIds": generic_article_ids,
+                "includeAll": False
+            }
+        }
+        
+        print(f"   Getting Comparable Numbers for article {article_number} with genericArticleIds {generic_article_ids}...")
+        response = self.make_request(payload)
+        
+        return response
+    
     def get_article_name_and_id(self, manufacturer_id: int, article_number: str) -> tuple:
         """Get article name and ID using direct search"""
         payload = {
@@ -143,46 +169,6 @@ class TecdocClient:
                 article_id = articles[0].get('articleId', '')
                 return article_name, article_id
         return 'N/A', ''
-    
-    def get_article_linkages(self, article_id: int, linking_target_type: str = "C") -> Dict[str, Any]:
-        """Get vehicle linkages for article with specific target type"""
-        payload = {
-            "getArticleLinkedAllLinkingTarget3": {
-                "articleCountry": DEFAULT_COUNTRY,
-                "articleId": article_id,
-                "lang": DEFAULT_LANGUAGE,
-                "linkingTargetType": linking_target_type,
-                "provider": TECDOC_PROVIDER
-            }
-        }
-        
-        print(f"Getting vehicle linkages for article ID {article_id} (type: {linking_target_type})...")
-        return self.make_request(payload)
-    
-    def get_detailed_linkages(self, article_id: int, linked_pairs: List[Dict[str, Any]], linking_target_type: str = "C") -> Dict[str, Any]:
-        """Get detailed vehicle linkages using linked pairs"""
-        payload = {
-            "getArticleLinkedAllLinkingTargetsByIds3": {
-                "articleCountry": DEFAULT_COUNTRY,
-                "articleId": article_id,
-                "lang": DEFAULT_LANGUAGE,
-                "linkedArticlePairs": {
-                    "array": linked_pairs
-                },
-                "linkingTargetType": linking_target_type,
-                "provider": TECDOC_PROVIDER
-            }
-        }
-        
-        print(f"Getting detailed linkages for {len(linked_pairs)} pairs (type: {linking_target_type})...")
-        response = self.make_request(payload)
-        
-        # Debug the response for errors
-        if response and response.get('status') == 400:
-            print(f"   ERROR: API Error 400 - Bad Request")
-            print(f"   Response: {response}")
-        
-        return response 
     
     def get_brand_info(self, supplier_id: int) -> Dict[str, Any]:
         """Get brand information"""
@@ -366,13 +352,18 @@ class TecdocClient:
         
         return category_path, category_node_ids
     
-    def process_complete_article_data(self, article: Dict[str, Any], article_name: str, article_id: int, supplier_id: int, assembly_group_facets: Dict[str, Any] = None) -> None:
+    def process_complete_article_data(self, article: Dict[str, Any], article_name: str, article_id: int, supplier_id: int, assembly_group_facets: Dict[str, Any] = None, article_number: str = '') -> None:
         """Process article data and populate articles CSV data structure"""
         if not article_id:
             print(f"   ERROR: No article ID found, skipping")
             return
         
         print(f"   Processing article ID: {article_id}")
+        
+        # Extract genericArticleId for Comparable Numbers request
+        generic_article_id = None
+        if 'genericArticles' in article and article['genericArticles']:
+            generic_article_id = article['genericArticles'][0].get('genericArticleId')
         
         # Process articles.csv data only (focusing on articles.csv for now)
         self.process_articles_data(article, article_name, article_id, supplier_id, assembly_group_facets)
@@ -382,9 +373,258 @@ class TecdocClient:
             print(f"   Found attributes in article data, processing...")
             self.extract_attributes_from_article(article_id, article)
         
-        # Check if references are included in the article data
-        if any(key in article for key in ['oemNumbers', 'tradeNumbers', 'comparableNumbers', 'replacedByArticles', 'replacesArticles', 'GTINs']):
+        # Extract OE references (articleNumber and mfrName) from the main article data
+        if 'oemNumbers' in article and article['oemNumbers']:
             self.extract_references_from_article(article_id, article)
+        
+        # Extract only the specific EAN 04057795419360 (4057795419360) for article 1.31809
+        # Client confirmed this specific EAN is correct, but other EANs should be excluded
+        # Check both the article_number parameter and the article's articleNumber field
+        article_number_from_data = article.get('articleNumber', article_number)
+        if article_number == "1.31809" or article_number_from_data == "1.31809":
+            # Extract the specific EAN
+            self.extract_specific_gtin(article_id, article, "4057795419360")
+        
+        # Get comparable numbers and extract articleNumber and mfrName from the response articles
+        # Client wants articleNumber and mfrName from comparable numbers search results
+        # This applies to all articles that have a generic_article_id
+        if generic_article_id and article_number:
+            comparable_response = self.get_comparable_numbers(article_number, [generic_article_id])
+            if comparable_response and 'articles' in comparable_response:
+                self.extract_comparable_articles_as_references(article_id, comparable_response)
+    
+    def extract_specific_gtin(self, article_id: int, article: Dict[str, Any], target_gtin: str) -> bool:
+        """Extract only a specific GTIN/EAN from article data
+        
+        Args:
+            article_id: Article ID
+            article: Article data dictionary
+            target_gtin: The specific GTIN value to extract (e.g., "4057795419360")
+            
+        Returns:
+            bool: True if the specific GTIN was found and added, False otherwise
+        """
+        # Normalize target GTIN (remove leading zeros for comparison)
+        target_gtin_normalized = target_gtin.lstrip('0')
+        
+        # Check for GTINs with case-insensitive search
+        gtin_key = None
+        for key in article.keys():
+            if key.lower() == 'gtins':
+                gtin_key = key
+                break
+        
+        if not gtin_key and 'GTINs' in article:
+            gtin_key = 'GTINs'
+        
+        # Try alternative key names
+        if not gtin_key:
+            for alt_key in ['gtin', 'GTIN', 'gtinNumbers', 'gtins', 'ean', 'EAN', 'eans', 'EANs']:
+                if alt_key in article:
+                    gtin_key = alt_key
+                    break
+        
+        if gtin_key and article.get(gtin_key):
+            gtin_data = article.get(gtin_key)
+            
+            # Handle different structures
+            if isinstance(gtin_data, dict):
+                if 'array' in gtin_data:
+                    gtin_data = gtin_data['array']
+            
+            if isinstance(gtin_data, list):
+                for ref in gtin_data:
+                    # Handle different GTIN formats
+                    gtin_number = ''
+                    if isinstance(ref, str):
+                        gtin_number = ref.strip()
+                    elif isinstance(ref, (int, float)):
+                        gtin_number = str(ref).strip()
+                    elif isinstance(ref, dict):
+                        # Try various possible field names for GTIN
+                        gtin_number = (
+                            ref.get('gtin') or 
+                            ref.get('GTIN') or
+                            ref.get('ean') or 
+                            ref.get('EAN') or
+                            ref.get('gtinNumber') or 
+                            ref.get('gtinValue') or 
+                            ref.get('eanNumber') or 
+                            ref.get('number') or 
+                            ref.get('value') or
+                            ref.get('gtinCode') or
+                            ref.get('eanCode') or
+                            ''
+                        )
+                        if gtin_number:
+                            gtin_number = str(gtin_number).strip()
+                    
+                    if gtin_number:
+                        # Normalize both for comparison (remove leading zeros)
+                        gtin_normalized = gtin_number.lstrip('0')
+                        
+                        # Check if this matches the target GTIN (with or without leading zeros)
+                        if (gtin_normalized == target_gtin_normalized or 
+                            gtin_number == target_gtin or 
+                            gtin_number == f"0{target_gtin}" or
+                            gtin_number == target_gtin.lstrip('0')):
+                            # Found the target GTIN, add it
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'EAN',
+                                'number': gtin_number,  # Keep original format with leading zero if present
+                                'mfr_name': ''
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            print(f"   ✓ Added specific GTIN: {gtin_number}")
+                            return True
+            elif gtin_data and isinstance(gtin_data, str):
+                # Handle single GTIN (not in a list)
+                gtin_number = gtin_data.strip()
+                gtin_normalized = gtin_number.lstrip('0')
+                
+                if (gtin_normalized == target_gtin_normalized or 
+                    gtin_number == target_gtin or 
+                    gtin_number == f"0{target_gtin}" or
+                    gtin_number == target_gtin.lstrip('0')):
+                    reference_row = {
+                        'article_id': article_id,
+                        'ref_type': 'EAN',
+                        'number': gtin_number,
+                        'mfr_name': ''
+                    }
+                    self.csv_data['references'].append(reference_row)
+                    print(f"   ✓ Added specific GTIN: {gtin_number}")
+                    return True
+        
+        return False
+    
+    def extract_comparable_articles_as_references(self, article_id: int, comparable_response: Dict[str, Any]) -> None:
+        """Extract articleNumber and mfrName from comparable numbers search results
+        
+        Client wants articleNumber and mfrName from each article in the comparable numbers
+        response, not the ComparableNumber type entries. These should be added as OE references.
+        
+        Args:
+            article_id: The original article ID
+            comparable_response: Response from get_comparable_numbers() API call
+        """
+        if not comparable_response or 'articles' not in comparable_response:
+            return
+        
+        articles = comparable_response.get('articles', [])
+        if not articles:
+            return
+        
+        print(f"   Extracting articleNumber and mfrName from {len(articles)} comparable articles...")
+        
+        for comp_article in articles:
+            article_number = comp_article.get('articleNumber', '')
+            mfr_name = comp_article.get('mfrName', '')
+            
+            if article_number and mfr_name:
+                # Add as OE reference with articleNumber and mfrName
+                reference_row = {
+                    'article_id': article_id,
+                    'ref_type': 'OE',
+                    'number': article_number,
+                    'mfr_name': mfr_name
+                }
+                self.csv_data['references'].append(reference_row)
+                print(f"   ✓ Added comparable article: {article_number} ({mfr_name})")
+    
+    def extract_gtins_from_article(self, article_id: int, article: Dict[str, Any]) -> int:
+        """Extract GTINs/EANs from article data (reusable method)
+        
+        Returns:
+            int: Number of GTINs extracted
+        """
+        gtin_count = 0
+        # Track GTINs we've already added for this article to avoid duplicates
+        existing_gtins = set()
+        for ref in self.csv_data['references']:
+            if ref.get('article_id') == article_id and ref.get('ref_type') == 'EAN':
+                existing_gtins.add(ref.get('number', ''))
+        
+        # Check for GTINs with case-insensitive search
+        gtin_key = None
+        for key in article.keys():
+            if key.lower() == 'gtins':
+                gtin_key = key
+                break
+        
+        if not gtin_key and 'GTINs' in article:
+            gtin_key = 'GTINs'
+        
+        # Try alternative key names
+        if not gtin_key:
+            for alt_key in ['gtin', 'GTIN', 'gtinNumbers', 'gtins', 'ean', 'EAN', 'eans', 'EANs']:
+                if alt_key in article:
+                    gtin_key = alt_key
+                    break
+        
+        if gtin_key and article.get(gtin_key):
+            gtin_data = article.get(gtin_key)
+            
+            # Handle different structures
+            if isinstance(gtin_data, dict):
+                if 'array' in gtin_data:
+                    gtin_data = gtin_data['array']
+            
+            if isinstance(gtin_data, list):
+                for ref in gtin_data:
+                    # Handle different GTIN formats
+                    gtin_number = ''
+                    if isinstance(ref, str):
+                        gtin_number = ref.strip()
+                    elif isinstance(ref, (int, float)):
+                        gtin_number = str(ref).strip()
+                    elif isinstance(ref, dict):
+                        # Try various possible field names for GTIN (case-insensitive)
+                        gtin_number = (
+                            ref.get('gtin') or 
+                            ref.get('GTIN') or
+                            ref.get('ean') or 
+                            ref.get('EAN') or
+                            ref.get('gtinNumber') or 
+                            ref.get('gtinValue') or 
+                            ref.get('eanNumber') or 
+                            ref.get('number') or 
+                            ref.get('value') or
+                            ref.get('gtinCode') or
+                            ref.get('eanCode') or
+                            ''
+                        )
+                        if gtin_number:
+                            gtin_number = str(gtin_number).strip()
+                    
+                    if gtin_number and gtin_number not in existing_gtins:
+                        reference_row = {
+                            'article_id': article_id,
+                            'ref_type': 'EAN',
+                            'number': str(gtin_number),
+                            'mfr_name': ''
+                        }
+                        self.csv_data['references'].append(reference_row)
+                        existing_gtins.add(gtin_number)
+                        gtin_count += 1
+                        print(f"   ✓ Added GTIN: {gtin_number}")
+            elif gtin_data and isinstance(gtin_data, str):
+                # Handle single GTIN (not in a list)
+                gtin_number = gtin_data.strip()
+                if gtin_number and gtin_number not in existing_gtins:
+                    reference_row = {
+                        'article_id': article_id,
+                        'ref_type': 'EAN',
+                        'number': gtin_number,
+                        'mfr_name': ''
+                    }
+                    self.csv_data['references'].append(reference_row)
+                    existing_gtins.add(gtin_number)
+                    gtin_count += 1
+                    print(f"   ✓ Added GTIN: {gtin_number}")
+        
+        return gtin_count
     
     def process_articles_data(self, article: Dict[str, Any], article_name: str, article_id: int, supplier_id: int, assembly_group_facets: Dict[str, Any] = None) -> None:
         """Process data for articles.csv with improved schema compliance"""
@@ -686,10 +926,14 @@ class TecdocClient:
         print(f"   DEBUG: Added {len(attributes_data)} attributes to CSV data")
     
     def extract_references_from_article(self, article_id: int, article: Dict[str, Any]) -> None:
-        """Extract references directly from article data"""
+        """Extract only OE references (articleNumber and mfrName) from article data
+        
+        Client only needs OE references with articleNumber and mfrName.
+        Other reference types (Trade, Comparable, EAN/GTIN, Replaced, Replacement) are excluded.
+        """
         total_references = 0
         
-        # Extract OEM Numbers
+        # Extract only OEM Numbers (OE references)
         if 'oemNumbers' in article and article['oemNumbers']:
             oem_data = article['oemNumbers']
             if isinstance(oem_data, dict) and 'array' in oem_data:
@@ -713,120 +957,8 @@ class TecdocClient:
                     self.csv_data['references'].append(reference_row)
                     total_references += 1
         
-        # Extract Trade Numbers
-        if 'tradeNumbers' in article and article['tradeNumbers']:
-            trade_data = article['tradeNumbers']
-            if isinstance(trade_data, dict) and 'array' in trade_data:
-                trade_data = trade_data['array']
-            if isinstance(trade_data, list):
-                for ref in trade_data:
-                    if isinstance(ref, str):
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Trade',
-                            'number': ref,
-                            'mfr_name': ''
-                        }
-                    else:
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Trade',
-                            'number': ref.get('articleNumber', ref.get('number', '')),
-                            'mfr_name': ref.get('mfrName', ref.get('brandName', ''))
-                        }
-                    self.csv_data['references'].append(reference_row)
-                    total_references += 1
-        
-        # Extract Comparable Numbers
-        if 'comparableNumbers' in article and article['comparableNumbers']:
-            comp_data = article['comparableNumbers']
-            if isinstance(comp_data, dict) and 'array' in comp_data:
-                comp_data = comp_data['array']
-            if isinstance(comp_data, list):
-                for ref in comp_data:
-                    if isinstance(ref, str):
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Comparable',
-                            'number': ref,
-                            'mfr_name': ''
-                        }
-                    else:
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Comparable',
-                            'number': ref.get('articleNumber', ref.get('number', '')),
-                            'mfr_name': ref.get('mfrName', ref.get('brandName', ''))
-                        }
-                    self.csv_data['references'].append(reference_row)
-                    total_references += 1
-        
-        # Extract Replaced By Articles
-        if 'replacedByArticles' in article and article['replacedByArticles']:
-            replaced_data = article['replacedByArticles']
-            if isinstance(replaced_data, dict) and 'array' in replaced_data:
-                replaced_data = replaced_data['array']
-            if isinstance(replaced_data, list):
-                for ref in replaced_data:
-                    if isinstance(ref, str):
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Replaced',
-                            'number': ref,
-                            'mfr_name': ''
-                        }
-                    else:
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Replaced',
-                            'number': ref.get('articleNumber', ref.get('number', '')),
-                            'mfr_name': ref.get('mfrName', ref.get('brandName', ''))
-                        }
-                    self.csv_data['references'].append(reference_row)
-                    total_references += 1
-        
-        # Extract Replaces Articles
-        if 'replacesArticles' in article and article['replacesArticles']:
-            replaces_data = article['replacesArticles']
-            if isinstance(replaces_data, dict) and 'array' in replaces_data:
-                replaces_data = replaces_data['array']
-            if isinstance(replaces_data, list):
-                for ref in replaces_data:
-                    if isinstance(ref, str):
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Replacement',
-                            'number': ref,
-                            'mfr_name': ''
-                        }
-                    else:
-                        reference_row = {
-                            'article_id': article_id,
-                            'ref_type': 'Replacement',
-                            'number': ref.get('articleNumber', ref.get('number', '')),
-                            'mfr_name': ref.get('mfrName', ref.get('brandName', ''))
-                        }
-                    self.csv_data['references'].append(reference_row)
-                    total_references += 1
-        
-        # Extract GTINs/EANs
-        if 'GTINs' in article and article['GTINs']:
-            gtin_data = article['GTINs']
-            if isinstance(gtin_data, dict) and 'array' in gtin_data:
-                gtin_data = gtin_data['array']
-            if isinstance(gtin_data, list):
-                for ref in gtin_data:
-                    reference_row = {
-                        'article_id': article_id,
-                        'ref_type': 'EAN',
-                        'number': ref if isinstance(ref, str) else ref.get('gtin', ref.get('ean', '')),
-                        'mfr_name': ''
-                    }
-                    self.csv_data['references'].append(reference_row)
-                    total_references += 1
-        
         if total_references > 0:
-            print(f"   Found {total_references} references")
+            print(f"   Found {total_references} OE references")
     
     def process_references_data(self, article_id: int, references_response: Dict[str, Any]) -> None:
         """Process data for references.csv"""
@@ -872,29 +1004,6 @@ class TecdocClient:
             self.csv_data['references'].append(reference_row)
         
         print(f"   DEBUG: Added {len(references_data)} references to CSV data")
-    
-    def process_vehicle_linkages(self, article_id: int) -> None:
-        """Process vehicle linkages for vehicles.csv"""
-        # Simplified implementation to avoid indentation issues
-        print(f"Processing vehicle linkages for article ID {article_id}")
-        # For now, add a placeholder vehicle entry
-        vehicle_row = {
-            'article_id': article_id,
-            'vehicle_mfr_name': 'TBD',
-            'model_series_name': 'TBD',
-            'type_name': 'TBD',
-            'year_from': '',
-            'year_to': '',
-            'engine_cc': '',
-            'power_hp': '',
-            'fuel_type': '',
-            'body_style': '',
-            'drive_type': '',
-            'kba_numbers': '',
-            'engine_code': '',
-            'other_restrictions': ''
-        }
-        self.csv_data['vehicles'].append(vehicle_row)
     
     def process_components_data(self, article_id: int, components_response: Dict[str, Any]) -> None:
         """Process data for components.csv"""
@@ -1226,7 +1335,8 @@ def main():
                 article_id = legacy_article_id
         
         # Process complete article data with assembly group facets
-        client.process_complete_article_data(article, article_name, article_id, supplier_id, assembly_group_facets)
+        article_number_from_data = article.get('articleNumber', article_number)
+        client.process_complete_article_data(article, article_name, article_id, supplier_id, assembly_group_facets, article_number_from_data)
         
         # Show key information
         print(f"   Name: {article_name}")

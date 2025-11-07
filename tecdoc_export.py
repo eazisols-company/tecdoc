@@ -32,6 +32,9 @@ DEFAULT_LANGUAGE = "de"
 TEST_MANUFACTURER_ID = 355  # DT Spare Parts (Article Manufacturer)
 TEST_ARTICLE_NUMBER = "1.31809"
 
+# Enrichment Settings
+ENABLE_VEHICLE_ENRICHMENT = True  # Set to False to skip enrichment (faster, but missing fuel_type, drive_type, kba_numbers, engine_code, other_restrictions)
+
 class TecdocClient:
     def __init__(self):
         self.base_url = TECDOC_BASE_URL
@@ -40,10 +43,13 @@ class TecdocClient:
             'articles': [],
             'attributes': [],
             'references': [],
+            'vehicles': [],
             'components': [],
             'article_relations': [],
             'brands': []
         }
+        # Temporary storage for vehicles with their IDs (for enrichment)
+        self.vehicle_lookup = {}  # linkageTargetId -> vehicle_row_dict
         
     def make_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Make API request to Tecdoc endpoint"""
@@ -212,6 +218,186 @@ class TecdocClient:
         }
         
         print(f"Getting article info for article ID {article_id}...")
+        return self.make_request(payload)
+    
+    def get_linked_manufacturers(self, article_id: int, linking_target_type: str = "P") -> Dict[str, Any]:
+        """Step 1: Get linked manufacturers for article (NEW 3-STEP APPROACH)
+        
+        linkingTargetType options:
+        - P = Passenger cars
+        - V = Commercial vehicles  
+        - O = CV + Tractor
+        - C = Both passenger and commercial
+        - M = Motorcycles
+        - A = Axles
+        """
+        payload = {
+            "getArticleLinkedAllLinkingTargetManufacturer2": {
+                "articleCountry": DEFAULT_COUNTRY,
+                "articleId": article_id,
+                "country": DEFAULT_COUNTRY,
+                "linkingTargetType": linking_target_type,
+                "provider": TECDOC_PROVIDER
+            }
+        }
+        
+        print(f"   Step 1: Getting linked manufacturers for article ID {article_id} (type: {linking_target_type})...")
+        return self.make_request(payload)
+    
+    def get_linkages_by_manufacturer(self, article_id: int, manufacturer_id: int, linking_target_type: str = "P") -> Dict[str, Any]:
+        """Step 2: Get article linkages for specific manufacturer (NEW 3-STEP APPROACH)
+        
+        Args:
+            article_id: Article ID
+            manufacturer_id: Manufacturer ID (manuId)
+            linking_target_type: Vehicle type (P, O, C, V, M, A)
+        """
+        payload = {
+            "getArticleLinkedAllLinkingTarget4": {
+                "articleCountry": DEFAULT_COUNTRY,
+                "articleId": article_id,
+                "country": DEFAULT_COUNTRY,
+                "lang": DEFAULT_LANGUAGE,
+                "linkingTargetManuId": manufacturer_id,
+                "linkingTargetType": linking_target_type,
+                "provider": TECDOC_PROVIDER
+            }
+        }
+        
+        print(f"   Step 2: Getting linkages for manufacturer {manufacturer_id}...")
+        return self.make_request(payload)
+    
+    def extract_linkage_pairs(self, linkages_response: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract linkage pairs from linkages response"""
+        linkage_pairs = []
+        
+        if 'data' in linkages_response:
+            data = linkages_response['data']
+            if 'array' in data:
+                for item in data['array']:
+                    if 'articleLinkages' in item and isinstance(item['articleLinkages'], dict):
+                        article_linkages = item['articleLinkages']
+                        if 'array' in article_linkages:
+                            for link in article_linkages['array']:
+                                if 'articleLinkId' in link and 'linkingTargetId' in link:
+                                    linkage_pairs.append({
+                                        'articleLinkId': link['articleLinkId'],
+                                        'linkingTargetId': link['linkingTargetId']
+                                    })
+        
+        return linkage_pairs
+    
+    def get_detailed_linkages(self, article_id: int, linked_pairs: List[Dict[str, Any]], linking_target_type: str = "P") -> Dict[str, Any]:
+        """Step 3: Get detailed vehicle linkages using linked pairs (NEW 3-STEP APPROACH)
+        
+        Args:
+            article_id: Article ID
+            linked_pairs: List of {"articleLinkId": X, "linkingTargetId": Y} pairs
+            linking_target_type: Vehicle type (P, O, C, V, M, A)
+        """
+        payload = {
+            "getArticleLinkedAllLinkingTargetsByIds3": {
+                "articleCountry": DEFAULT_COUNTRY,
+                "articleId": article_id,
+                "immediateAttributs": True,
+                "includeCriteria": True,
+                "includeLinkages": True,
+                "includeDocuments": True,
+                "includeImages": True,
+                "lang": DEFAULT_LANGUAGE,
+                "linkedArticlePairs": {
+                    "array": linked_pairs
+                },
+                "linkingTargetType": linking_target_type,
+                "provider": TECDOC_PROVIDER
+            }
+        }
+        
+        response = self.make_request(payload)
+        
+        # Debug the response for errors
+        if response and response.get('status') == 400:
+            print(f"      ERROR: API Error 400 - {response.get('statusText', 'Unknown error')}")
+        
+        return response
+    
+    def get_linkage_targets(self, mfr_ids: List[int], linkage_target_type: str = "P", vehicle_model_series_ids: List[int] = None) -> Dict[str, Any]:
+        """Get detailed linkage targets by manufacturer IDs (provides kbaNumbers, driveType, fuelType, engines)"""
+        payload = {
+            "getLinkageTargets": {
+                "provider": TECDOC_PROVIDER,
+                "linkageTargetCountry": DEFAULT_COUNTRY.upper(),
+                "lang": DEFAULT_LANGUAGE,
+                "linkageTargetType": linkage_target_type,
+                "mfrIds": mfr_ids,
+                "perPage": 100,  # API max is 100 per page
+                "page": 1
+            }
+        }
+        
+        if vehicle_model_series_ids:
+            payload["getLinkageTargets"]["vehicleModelSeriesIds"] = vehicle_model_series_ids
+        
+        print(f"   Getting linkage targets for {len(mfr_ids)} manufacturers (type: {linkage_target_type})...")
+        response = self.make_request(payload)
+        
+        # Debug the response
+        if response:
+            print(f"   DEBUG: get_linkage_targets response keys: {list(response.keys())}")
+            if 'status' in response:
+                print(f"   DEBUG: Response status: {response.get('status')}")
+            if 'linkageTargets' in response:
+                print(f"   DEBUG: linkageTargets present with {len(response.get('linkageTargets', []))} targets")
+        else:
+            print(f"   DEBUG: get_linkage_targets returned None or empty")
+        
+        # If paginated, we need to get all pages
+        if response and 'total' in response:
+            total = response.get('total', 0)
+            returned = len(response.get('linkageTargets', []))
+            print(f"   Got {returned} of {total} linkage targets on first page")
+            
+            if total > returned and returned > 0:
+                print(f"   Fetching remaining pages to get all {total} linkage targets...")
+                all_targets = response.get('linkageTargets', [])
+                page = 2
+                max_pages = 500  # Increased limit to fetch more linkage targets (up to 50,000 targets)
+                while returned < total and page <= max_pages:
+                    payload["getLinkageTargets"]["page"] = page
+                    page_response = self.make_request(payload)
+                    if page_response and 'linkageTargets' in page_response:
+                        page_targets = page_response.get('linkageTargets', [])
+                        if len(page_targets) == 0:
+                            print(f"   Page {page} returned 0 targets, stopping pagination")
+                            break
+                        all_targets.extend(page_targets)
+                        returned += len(page_targets)
+                        if page % 10 == 0:  # Print every 10 pages
+                            print(f"   Fetched page {page}: {len(page_targets)} linkage targets (total: {returned}/{total})")
+                        page += 1
+                    else:
+                        print(f"   Page {page} failed, stopping pagination")
+                        break
+                response['linkageTargets'] = all_targets
+                print(f"   Fetched {len(all_targets)} linkage targets total across {page-1} pages")
+        
+        return response
+    
+    def get_linkage_targets_by_ids(self, linkage_target_ids: List[int], linkage_target_type: str = "P") -> Dict[str, Any]:
+        """Get linkage targets by specific linkageTargetIds (if API supports this parameter)"""
+        payload = {
+            "getLinkageTargets": {
+                "provider": TECDOC_PROVIDER,
+                "linkageTargetCountry": DEFAULT_COUNTRY.upper(),
+                "lang": DEFAULT_LANGUAGE,
+                "linkageTargetType": linkage_target_type,
+                "linkageTargetIds": linkage_target_ids,  # Try this parameter
+                "perPage": 100,  # API max is 100 per page
+                "page": 1
+            }
+        }
+        
+        print(f"   Trying to get linkage targets by IDs ({len(linkage_target_ids)} IDs)...")
         return self.make_request(payload)
     
     def extract_image_urls(self, images_data: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -1100,6 +1286,357 @@ class TecdocClient:
         
         self.csv_data['brands'].append(brand_row)
     
+    def _format_year_month(self, date_value: Any) -> str:
+        """Format date to YYYY-MM format
+        
+        Handles:
+        - YYYYMM format (e.g., 199406 -> 1994-06)
+        - YYYY format (e.g., 1994 -> 1994-01)
+        - Already formatted YYYY-MM (returns as-is)
+        """
+        if not date_value:
+            return ''
+        
+        date_str = str(date_value)
+        
+        # If it's already in YYYY-MM format
+        if len(date_str) == 7 and '-' in date_str:
+            return date_str
+        
+        # If it's YYYYMM format (e.g., 199406)
+        if len(date_str) == 6 and date_str.isdigit():
+            return f"{date_str[:4]}-{date_str[4:6]}"
+        
+        # If it's just YYYY
+        if len(date_str) == 4 and date_str.isdigit():
+            return f"{date_str}-01"
+        
+        return date_str
+    
+    def process_vehicle_linkages(self, article_id: int, linkages_response: Dict[str, Any], linkage_pairs_map: Dict[int, int] = None) -> None:
+        """Process vehicle linkages for vehicles.csv
+        
+        Args:
+            article_id: Article ID
+            linkages_response: Response from getArticleLinkedAllLinkingTargetsByIds3
+            linkage_pairs_map: Map of articleLinkId -> linkingTargetId (for enrichment matching)
+        """
+        if not linkages_response:
+            return
+        
+        # Check for different possible response structures
+        linkages_data = None
+        
+        # Try direct array access
+        if 'array' in linkages_response:
+            linkages_data = linkages_response['array']
+        # Try data.array structure
+        elif 'data' in linkages_response:
+            data = linkages_response.get('data', {})
+            if 'array' in data:
+                linkages_data = data['array']
+            elif isinstance(data, list):
+                linkages_data = data
+        
+        if not linkages_data or not isinstance(linkages_data, list):
+            return
+        
+        # Extract actual vehicle data from linkedVehicles field
+        actual_vehicles = []
+        for item in linkages_data:
+            if isinstance(item, dict):
+                article_link_id = item.get('articleLinkId', '')
+                linking_target_id = item.get('linkingTargetId', '')
+                
+                if 'linkedVehicles' in item:
+                    linked_vehicles = item['linkedVehicles']
+                    if isinstance(linked_vehicles, dict) and 'array' in linked_vehicles:
+                        for vehicle in linked_vehicles['array']:
+                            vehicle['_articleLinkId'] = article_link_id  # Store for mapping
+                            vehicle['_linkingTargetId'] = linking_target_id  # Store for enrichment
+                            vehicle['_constructionType'] = vehicle.get('constructionType', '')  # Store for fallback body_style
+                            actual_vehicles.append(vehicle)
+                    elif isinstance(linked_vehicles, list):
+                        for vehicle in linked_vehicles:
+                            vehicle['_articleLinkId'] = article_link_id  # Store for mapping
+                            vehicle['_linkingTargetId'] = linking_target_id  # Store for enrichment
+                            vehicle['_constructionType'] = vehicle.get('constructionType', '')  # Store for fallback body_style
+                            actual_vehicles.append(vehicle)
+        
+        if not actual_vehicles:
+            return
+        
+        print(f"      Processing {len(actual_vehicles)} vehicles from this batch")
+        
+        for vehicle in actual_vehicles:
+            # Extract year range
+            year_from = self._format_year_month(vehicle.get('yearOfConstructionFrom', ''))
+            year_to = self._format_year_month(vehicle.get('yearOfConstructionTo', ''))
+            
+            # Extract power HP (use range if available)
+            power_hp = ''
+            if 'powerHpFrom' in vehicle:
+                power_from = vehicle.get('powerHpFrom', '')
+                power_to = vehicle.get('powerHpTo', '')
+                if power_from and power_to and power_from != power_to:
+                    power_hp = f"{power_from}-{power_to}"
+                elif power_from:
+                    power_hp = str(power_from)
+            
+            # Get linkingTargetId for enrichment
+            linking_target_id = vehicle.get('_linkingTargetId') or vehicle.get('carId', '')
+            
+            # Get constructionType for fallback body_style
+            construction_type = vehicle.get('_constructionType', vehicle.get('constructionType', ''))
+            
+            vehicle_row = {
+                'article_id': article_id,
+                'vehicle_mfr_name': vehicle.get('manuDesc', ''),
+                'model_series_name': vehicle.get('modelDesc', ''),
+                'type_name': vehicle.get('carDesc', ''),
+                'year_from': year_from,
+                'year_to': year_to,
+                'engine_cc': str(vehicle.get('cylinderCapacity', '')) if vehicle.get('cylinderCapacity') else '',
+                'power_hp': power_hp,
+                'fuel_type': '',  # Will be enriched from getLinkageTargets
+                'body_style': construction_type,  # Use constructionType as fallback, will be enriched if available
+                'drive_type': '',  # Will be enriched from getLinkageTargets
+                'kba_numbers': '',  # Will be enriched from getLinkageTargets
+                'engine_code': '',  # Will be enriched from getLinkageTargets
+                'other_restrictions': ''  # Will be enriched from getLinkageTargets
+            }
+            
+            # Store vehicle with linkingTargetId for enrichment
+            if linking_target_id:
+                if linking_target_id not in self.vehicle_lookup:
+                    self.vehicle_lookup[linking_target_id] = []
+                self.vehicle_lookup[linking_target_id].append({
+                    'row': vehicle_row,
+                    'mfr_id': vehicle.get('manuId', ''),
+                    'mfr_name': vehicle.get('manuDesc', ''),
+                    'construction_type': construction_type  # Store for fallback matching
+                })
+            else:
+                # If no lookup key, add vehicle directly to CSV data (fallback)
+                print(f"   WARNING: Vehicle has no lookup key, adding directly to CSV: {vehicle_row.get('type_name', 'Unknown')}")
+                self.csv_data['vehicles'].append(vehicle_row)
+    
+    def enrich_vehicles_with_linkage_targets(self, vehicle_type: str = "P") -> None:
+        """Enrich vehicle records with detailed linkage target data (kbaNumbers, driveType, fuelType, engines)"""
+        if not self.vehicle_lookup:
+            return
+        
+        # Collect unique manufacturer IDs and linkageTargetIds we need
+        mfr_ids = set()
+        linkage_target_ids_needed = set()
+        for linkage_target_id in self.vehicle_lookup.keys():
+            linkage_target_ids_needed.add(linkage_target_id)
+            for vehicle_info in self.vehicle_lookup[linkage_target_id]:
+                mfr_id = vehicle_info.get('mfr_id')
+                if mfr_id:
+                    mfr_ids.add(mfr_id)
+        
+        if not mfr_ids:
+            # No manufacturer IDs, just add vehicles as-is
+            for vehicle_list in self.vehicle_lookup.values():
+                for vehicle_info in vehicle_list:
+                    self.csv_data['vehicles'].append(vehicle_info['row'])
+            self.vehicle_lookup.clear()
+            return
+        
+        print(f"   Enriching vehicles with linkage target details...")
+        print(f"   Looking for {len(linkage_target_ids_needed)} specific linkage target IDs from {len(mfr_ids)} manufacturers...")
+        
+        # First try: Use linkageTargetIds parameter if supported
+        linkage_targets_response = None
+        if linkage_target_ids_needed:
+            try:
+                linkage_targets_response = self.get_linkage_targets_by_ids(list(linkage_target_ids_needed), vehicle_type)
+                # Check if we got results
+                if not linkage_targets_response or not linkage_targets_response.get('linkageTargets'):
+                    print(f"   Note: linkageTargetIds parameter returned no results, trying manufacturer-based query...")
+                    linkage_targets_response = None
+            except Exception as e:
+                print(f"   Note: Getting linkage targets by IDs failed: {e}")
+                linkage_targets_response = None
+        
+        # Fallback: Get linkage targets for all manufacturers (if specific IDs didn't work)
+        if not linkage_targets_response or not linkage_targets_response.get('linkageTargets'):
+            linkage_targets_response = self.get_linkage_targets(list(mfr_ids), vehicle_type)
+            
+            # Debug the response if we still have no results
+            if linkage_targets_response:
+                print(f"   DEBUG: Enrichment response keys: {list(linkage_targets_response.keys())}")
+                if 'linkageTargets' in linkage_targets_response:
+                    print(f"   DEBUG: linkageTargets count: {len(linkage_targets_response.get('linkageTargets', []))}")
+                if 'total' in linkage_targets_response:
+                    print(f"   DEBUG: Total available: {linkage_targets_response.get('total')}")
+                if 'status' in linkage_targets_response:
+                    print(f"   DEBUG: Response status: {linkage_targets_response.get('status')}")
+            else:
+                print(f"   DEBUG: Enrichment response is None or empty")
+        
+        # Create lookup dictionary: linkageTargetId -> linkageTarget data
+        linkage_targets_lookup = {}
+        for target in linkage_targets_response.get('linkageTargets', []):
+            linkage_target_id = target.get('linkageTargetId')
+            if linkage_target_id:
+                linkage_targets_lookup[linkage_target_id] = target
+        
+        if not linkage_targets_lookup:
+            print(f"   WARNING: No linkage targets found in API response. Vehicles will be exported without enrichment.")
+            # Add vehicles as-is without enrichment
+            for linkage_target_id, vehicle_list in self.vehicle_lookup.items():
+                for vehicle_info in vehicle_list:
+                    self.csv_data['vehicles'].append(vehicle_info['row'])
+            self.vehicle_lookup.clear()
+            return
+        
+        print(f"   Matching {len(self.vehicle_lookup)} vehicle IDs with {len(linkage_targets_lookup)} linkage targets")
+        
+        # Debug: Show sample IDs we're looking for vs what we have
+        sample_looking = list(self.vehicle_lookup.keys())[:5]
+        sample_found = list(linkage_targets_lookup.keys())[:5]
+        print(f"   Sample IDs we need: {sample_looking}")
+        print(f"   Sample IDs found: {sample_found}")
+        
+        # Enrich vehicles and add to CSV data
+        enriched_count = 0
+        matched_count = 0
+        unmatched_count = 0
+        
+        # Create a comprehensive matching system since linkageTargetIds from step3 don't match enrichment IDs
+        # Build multiple lookup strategies for better matching
+        
+        # Strategy 1: By description (type name) + manufacturer + model series
+        lookup_by_desc = {}
+        # Strategy 2: By manufacturer + model series + power + year + capacity
+        lookup_by_specs = {}
+        
+        for target in linkage_targets_response.get('linkageTargets', []):
+            desc = target.get('description', '').strip()
+            model_series = target.get('vehicleModelSeriesName', '').strip()
+            mfr_id = target.get('mfrId', '')
+            power_hp = target.get('horsePowerFrom', '')
+            year_from = target.get('beginYearMonth', '')
+            capacity = target.get('capacityCC', '')
+            
+            # Strategy 1: By description
+            if desc and mfr_id:
+                key = f"{mfr_id}_{desc}"
+                if key not in lookup_by_desc:
+                    lookup_by_desc[key] = []
+                lookup_by_desc[key].append(target)
+            
+            # Strategy 2: By specs (for more precise matching)
+            if mfr_id and model_series and power_hp and capacity:
+                key = f"{mfr_id}_{model_series}_{power_hp}_{capacity}"
+                if key not in lookup_by_specs:
+                    lookup_by_specs[key] = []
+                lookup_by_specs[key].append(target)
+        
+        print(f"   Built fallback lookup: {len(lookup_by_desc)} desc keys, {len(lookup_by_specs)} spec keys")
+        
+        for linkage_target_id, vehicle_list in self.vehicle_lookup.items():
+            # Process each vehicle individually - each needs its own matching
+            for vehicle_info in vehicle_list:
+                vehicle_row = vehicle_info['row'].copy()
+                
+                # Get linkage target by ID (will likely not match)
+                linkage_target = linkage_targets_lookup.get(linkage_target_id, {})
+                
+                # If no direct match, try fallback matching strategies
+                if not linkage_target:
+                    mfr_id = vehicle_info.get('mfr_id', '')
+                    model_series = vehicle_row.get('model_series_name', '').strip()
+                    type_name = vehicle_row.get('type_name', '').strip()
+                    power_hp = vehicle_row.get('power_hp', '').strip()
+                    engine_cc = vehicle_row.get('engine_cc', '').strip()
+                    
+                    # Try Strategy 1: Match by description (type_name)
+                    if mfr_id and type_name:
+                        # First try exact match
+                        key = f"{mfr_id}_{type_name}"
+                        if key in lookup_by_desc and lookup_by_desc[key]:
+                            linkage_target = lookup_by_desc[key][0]
+                        else:
+                            # Try partial match - type_name might be longer/shorter
+                            for lookup_key, targets in lookup_by_desc.items():
+                                if lookup_key.startswith(f"{mfr_id}_") and targets:
+                                    target_desc = targets[0].get('description', '')
+                                    # Check if type_name contains the description or vice versa
+                                    if (type_name in target_desc or target_desc in type_name) and len(type_name) > 5:
+                                        # Also check power HP to ensure it's the same vehicle
+                                        target_power = str(targets[0].get('horsePowerFrom', ''))
+                                        if power_hp == target_power or not target_power:
+                                            linkage_target = targets[0]
+                                            break
+                    
+                    # Try Strategy 2: Match by specs if Strategy 1 failed
+                    if not linkage_target and mfr_id and model_series and power_hp and engine_cc:
+                        key = f"{mfr_id}_{model_series}_{power_hp}_{engine_cc}"
+                        if key in lookup_by_specs and lookup_by_specs[key]:
+                            linkage_target = lookup_by_specs[key][0]
+                
+                # Track matching
+                if linkage_target:
+                    matched_count += 1
+                else:
+                    unmatched_count += 1
+                
+                # Only enrich if we found a matching linkage target
+                if linkage_target:
+                    # Extract KBA numbers
+                    kba_numbers = []
+                    if 'kbaNumbers' in linkage_target and linkage_target['kbaNumbers']:
+                        kba_numbers = [str(k) for k in linkage_target['kbaNumbers'] if k]
+                    
+                    # Extract engine codes
+                    engine_codes = []
+                    if 'engines' in linkage_target and linkage_target['engines']:
+                        for engine in linkage_target['engines']:
+                            if isinstance(engine, dict):
+                                code = engine.get('code', '')
+                                if code:
+                                    engine_codes.append(code)
+                            elif isinstance(engine, str):
+                                engine_codes.append(engine)
+                    
+                    # Extract restrictions/criteria
+                    restrictions = []
+                    if 'vehiclesInOperation' in linkage_target and linkage_target['vehiclesInOperation']:
+                        for restriction in linkage_target['vehiclesInOperation']:
+                            if isinstance(restriction, str):
+                                restrictions.append(restriction)
+                            elif isinstance(restriction, dict):
+                                desc = restriction.get('description', restriction.get('text', ''))
+                                if desc:
+                                    restrictions.append(desc)
+                    
+                    # Update vehicle row with enriched data
+                    vehicle_row['fuel_type'] = linkage_target.get('fuelType', '') or vehicle_row.get('fuel_type', '')
+                    # Use enriched bodyStyle if available, otherwise keep the fallback constructionType
+                    enriched_body_style = linkage_target.get('bodyStyle', '')
+                    if enriched_body_style:
+                        vehicle_row['body_style'] = enriched_body_style
+                    # Otherwise keep the existing body_style (which has constructionType as fallback)
+                    vehicle_row['drive_type'] = linkage_target.get('driveType', '') or vehicle_row.get('drive_type', '')
+                    vehicle_row['kba_numbers'] = '|'.join(kba_numbers) if kba_numbers else vehicle_row.get('kba_numbers', '')
+                    vehicle_row['engine_code'] = '|'.join(engine_codes) if engine_codes else vehicle_row.get('engine_code', '')
+                    vehicle_row['other_restrictions'] = '|'.join(restrictions) if restrictions else vehicle_row.get('other_restrictions', '')
+                
+                # Always add vehicle to CSV data, even if enrichment failed
+                self.csv_data['vehicles'].append(vehicle_row)
+                enriched_count += 1
+        
+        if matched_count > 0:
+            print(f"   SUCCESS: Added {enriched_count} vehicles to CSV ({matched_count} matched with linkage target details, {unmatched_count} without enrichment)")
+        else:
+            print(f"   NOTE: Added {enriched_count} vehicles to CSV but found 0 matches - vehicles exported without enrichment")
+        
+        # Clear lookup after enrichment
+        self.vehicle_lookup.clear()
+    
     def export_articles_csv(self, filename: str = None) -> str:
         """Export articles data to CSV file (focused on articles.csv only)"""
         if not filename:
@@ -1203,6 +1740,41 @@ class TecdocClient:
             
         except Exception as e:
             print(f"ERROR: Error creating references.csv: {e}")
+            return ""
+    
+    def export_vehicles_csv(self, filename: str = None) -> str:
+        """Export vehicles data to CSV file"""
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"vehicles_{timestamp}.csv"
+        
+        # Define vehicles CSV schema according to client requirements (14 columns)
+        vehicles_columns = [
+            'article_id', 'vehicle_mfr_name', 'model_series_name', 'type_name',
+            'year_from', 'year_to', 'engine_cc', 'power_hp', 'fuel_type',
+            'body_style', 'drive_type', 'kba_numbers', 'engine_code', 'other_restrictions'
+        ]
+        
+        data = self.csv_data['vehicles']
+        
+        if not data:
+            print("WARNING: No vehicles data to export")
+            return ""
+        
+        try:
+            df = pd.DataFrame(data)
+            df = df.reindex(columns=vehicles_columns, fill_value='')
+            
+            # Export with semicolon delimiter as per client requirements
+            df.to_csv(filename, index=False, encoding='utf-8', sep=';')
+            
+            print(f"SUCCESS: vehicles.csv created: {len(data)} records")
+            print(f"File: {filename}")
+            
+            return filename
+            
+        except Exception as e:
+            print(f"ERROR: Error creating vehicles.csv: {e}")
             return ""
     
     def export_to_csv(self, data: List[Dict[str, Any]], filename: str = None) -> str:
@@ -1344,6 +1916,93 @@ def main():
         print(f"   Article ID: {article_id}")
         print(f"   Supplier ID: {supplier_id}")
         print(f"   Article Number: {article.get('articleNumber', 'Unknown')}")
+        
+        # Step 3b: Get and process vehicle linkages for this article
+        if article_id:
+            # Configure vehicle types to process (can be changed as needed)
+            # P = Passenger cars, O = CV + Tractor, V = Commercial vehicles, C = Both P+V
+            # M = Motorcycles, A = Axles
+            vehicle_types_to_process = ['P', 'O', 'V', 'C', 'M', 'A']  # Process all vehicle types
+            
+            for vehicle_type in vehicle_types_to_process:
+                print(f"\n   Processing vehicle type: {vehicle_type}")
+                
+                # NEW 3-STEP APPROACH (as per client requirements)
+                # Step 1: Get linked manufacturers
+                manufacturers_response = client.get_linked_manufacturers(article_id, vehicle_type)
+                
+                if not manufacturers_response or 'data' not in manufacturers_response:
+                    print(f"   No manufacturers found for vehicle type {vehicle_type}")
+                    continue
+                
+                manufacturers_data = manufacturers_response.get('data', {})
+                if 'array' not in manufacturers_data:
+                    print(f"   No manufacturers array found for vehicle type {vehicle_type}")
+                    continue
+                
+                manufacturers = manufacturers_data['array']
+                print(f"   Found {len(manufacturers)} linked manufacturers")
+                
+                # Step 2 & 3: For each manufacturer, get linkages and then vehicle details
+                for mfr in manufacturers:
+                    mfr_id = mfr.get('manuId')
+                    mfr_name = mfr.get('manuName', 'Unknown')
+                    
+                    if not mfr_id:
+                        continue
+                    
+                    print(f"   Processing manufacturer: {mfr_name} (ID: {mfr_id})")
+                    
+                    # Step 2: Get linkages for this manufacturer
+                    linkages_response = client.get_linkages_by_manufacturer(article_id, mfr_id, vehicle_type)
+                    
+                    if not linkages_response or 'data' not in linkages_response:
+                        print(f"      No linkages found for manufacturer {mfr_name}")
+                        continue
+                    
+                    linkages_data = linkages_response.get('data', {})
+                    if 'array' not in linkages_data:
+                        print(f"      No linkages array found for manufacturer {mfr_name}")
+                        continue
+                    
+                    # Extract linkage pairs from the response
+                    all_linkage_pairs = client.extract_linkage_pairs(linkages_response)
+                    
+                    if not all_linkage_pairs:
+                        print(f"      No linkage pairs found for manufacturer {mfr_name}")
+                        continue
+                    
+                    print(f"      Found {len(all_linkage_pairs)} linkage pairs")
+                    
+                    # Step 3: Get detailed vehicle data in batches (API limit is 25 pairs per request)
+                    batch_size = 25
+                    for i in range(0, len(all_linkage_pairs), batch_size):
+                        batch = all_linkage_pairs[i:i+batch_size]
+                        print(f"      Fetching batch {i//batch_size + 1}/{(len(all_linkage_pairs)-1)//batch_size + 1} ({len(batch)} linkages)...")
+                        
+                        # Create map: articleLinkId -> linkingTargetId for enrichment
+                        linkage_pairs_map = {pair['articleLinkId']: pair['linkingTargetId'] for pair in batch}
+                        
+                        # Get full vehicle details using the linkage pairs
+                        detailed_response = client.get_detailed_linkages(article_id, batch, vehicle_type)
+                        if detailed_response:
+                            client.process_vehicle_linkages(article_id, detailed_response, linkage_pairs_map)
+                
+                # After all manufacturers are processed, enrich vehicles with linkage target details
+                if ENABLE_VEHICLE_ENRICHMENT:
+                    if client.vehicle_lookup:
+                        print(f"   Enriching vehicles for type {vehicle_type}...")
+                        client.enrich_vehicles_with_linkage_targets(vehicle_type)
+                    else:
+                        print(f"   WARNING: No vehicles in lookup for type {vehicle_type}, skipping enrichment")
+                else:
+                    # Skip enrichment, add vehicles directly to CSV
+                    if client.vehicle_lookup:
+                        for vehicle_list in client.vehicle_lookup.values():
+                            for vehicle_info in vehicle_list:
+                                client.csv_data['vehicles'].append(vehicle_info['row'])
+                        client.vehicle_lookup.clear()
+                        print(f"   Skipped enrichment (ENABLE_VEHICLE_ENRICHMENT=False)")
     
     # Step 4: Export to articles.csv (focused export)
     print(f"\nExporting to articles.csv...")
@@ -1356,6 +2015,10 @@ def main():
     # Step 6: Export to references.csv
     print(f"\nExporting to references.csv...")
     created_references_file = client.export_references_csv()
+    
+    # Step 7: Export to vehicles.csv
+    print(f"\nExporting to vehicles.csv...")
+    created_vehicles_file = client.export_vehicles_csv()
     
     if created_file:
         print(f"\n" + "="*50)
@@ -1370,6 +2033,9 @@ def main():
             file_num += 1
         if created_references_file:
             print(f"   {file_num}. {created_references_file}")
+            file_num += 1
+        if created_vehicles_file:
+            print(f"   {file_num}. {created_vehicles_file}")
         
         # Show summary of articles data
         articles_data = client.csv_data['articles']
@@ -1411,6 +2077,21 @@ def main():
                 sample_ref = references_data[0]
                 print(f"   Sample reference data:")
                 for key, value in sample_ref.items():
+                    if value:  # Only show fields with data
+                        display_value = str(value)[:100] + "..." if len(str(value)) > 100 else str(value)
+                        print(f"     {key}: {display_value}")
+        
+        # Show summary of vehicles data
+        vehicles_data = client.csv_data['vehicles']
+        if vehicles_data:
+            print(f"\nVehicles Data Summary:")
+            print(f"   Total vehicle linkages: {len(vehicles_data)}")
+            
+            # Show sample of what was extracted
+            if len(vehicles_data) > 0:
+                sample_vehicle = vehicles_data[0]
+                print(f"   Sample vehicle data:")
+                for key, value in sample_vehicle.items():
                     if value:  # Only show fields with data
                         display_value = str(value)[:100] + "..." if len(str(value)) > 100 else str(value)
                         print(f"     {key}: {display_value}")

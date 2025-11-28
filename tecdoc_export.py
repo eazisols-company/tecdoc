@@ -32,6 +32,16 @@ DEFAULT_LANGUAGE = "de"
 TEST_MANUFACTURER_ID = 355  # DT Spare Parts (Article Manufacturer)
 TEST_ARTICLE_NUMBER = "1.31809"
 
+# CLIENT REQUIREMENT: Multiple articles to process in one consolidated export
+# Format: (manufacturer_id/dataSupplierId, article_number)
+ARTICLES_TO_PROCESS = [
+    (355, "1.31809"),   # DT Spare Parts - Lufttrocknerpatrone
+    (355, "4.61919"),   # DT Spare Parts
+    (355, "5.15025"),   # DT Spare Parts - Sensor, Kraftstoffvorrat
+    (205, "38953"),     # NRF - Test passenger car (Type P) data
+    (80, "860168N"),    # AKS Dasis - Test passenger car (Type P) data
+]
+
 # Enrichment Settings
 ENABLE_VEHICLE_ENRICHMENT = True  # Set to False to skip enrichment (faster, but missing fuel_type, drive_type, kba_numbers, engine_code, other_restrictions)
 
@@ -123,6 +133,43 @@ class TecdocClient:
         
         print(f"Getting enhanced article data for ID {article_id}...")
         return self.make_request(payload)
+    
+    def get_all_reference_numbers(self, article_number: str, generic_article_ids: List[int]) -> Dict[str, Any]:
+        """Get all reference numbers (EAN, trade numbers, comparable numbers, etc.) using searchType 10
+        
+        searchType 10 searches all number types (0-7) at once:
+        - 0: Article Number (IAM)
+        - 1: OE Number
+        - 2: Trade Number
+        - 3: Comparable Number
+        - 4: Replacement Number
+        - 5: Replaced Number
+        - 6: EAN Number
+        - 7: Criteria Number
+        
+        Args:
+            article_number: The article number to search for
+            generic_article_ids: List of generic article IDs (e.g., [340] for article 1.31809)
+        """
+        if not generic_article_ids:
+            return {}
+        
+        payload = {
+            "getArticles": {
+                "provider": TECDOC_PROVIDER,
+                "articleCountry": DEFAULT_COUNTRY.upper(),
+                "lang": DEFAULT_LANGUAGE,
+                "searchQuery": article_number,
+                "searchType": 10,
+                "genericArticleIds": generic_article_ids,
+                "includeAll": True
+            }
+        }
+        
+        print(f"   Getting all reference numbers for article {article_number} with genericArticleIds {generic_article_ids} (searchType: 10)...")
+        response = self.make_request(payload)
+        
+        return response
     
     def get_comparable_numbers(self, article_number: str, generic_article_ids: List[int]) -> Dict[str, Any]:
         """Get Comparable Numbers using genericArticleIds as per client requirements
@@ -563,21 +610,16 @@ class TecdocClient:
         if 'oemNumbers' in article and article['oemNumbers']:
             self.extract_references_from_article(article_id, article)
         
-        # Extract only the specific EAN 04057795419360 (4057795419360) for article 1.31809
-        # Client confirmed this specific EAN is correct, but other EANs should be excluded
-        # Check both the article_number parameter and the article's articleNumber field
+        # Get all reference numbers using searchType 10 (searches all number types 0-7)
+        # This includes: EAN, Trade Numbers, Comparable Numbers, Replacement Numbers, etc.
+        # Client wants all reference numbers extracted using genericArticleIds
+        # CLIENT REQUIREMENT: Pass supplier_id and article_number to filter out other manufacturers
         article_number_from_data = article.get('articleNumber', article_number)
-        if article_number == "1.31809" or article_number_from_data == "1.31809":
-            # Extract the specific EAN
-            self.extract_specific_gtin(article_id, article, "4057795419360")
-        
-        # Get comparable numbers and extract articleNumber and mfrName from the response articles
-        # Client wants articleNumber and mfrName from comparable numbers search results
-        # This applies to all articles that have a generic_article_id
-        if generic_article_id and article_number:
-            comparable_response = self.get_comparable_numbers(article_number, [generic_article_id])
-            if comparable_response and 'articles' in comparable_response:
-                self.extract_comparable_articles_as_references(article_id, comparable_response)
+        if generic_article_id and article_number_from_data:
+            print(f"   Getting all reference numbers for article {article_number_from_data} with genericArticleId {generic_article_id}...")
+            reference_response = self.get_all_reference_numbers(article_number_from_data, [generic_article_id])
+            if reference_response and 'articles' in reference_response:
+                self.extract_all_reference_numbers(article_id, reference_response, supplier_id, article_number_from_data)
     
     def extract_specific_gtin(self, article_id: int, article: Dict[str, Any], target_gtin: str) -> bool:
         """Extract only a specific GTIN/EAN from article data
@@ -684,6 +726,203 @@ class TecdocClient:
                     return True
         
         return False
+    
+    def extract_all_reference_numbers(self, article_id: int, reference_response: Dict[str, Any], supplier_id: int = None, article_number: str = None) -> None:
+        """Extract all reference numbers from searchType 10 response
+        
+        Extracts:
+        - GTINs/EANs (ref_type: 'EAN') - ONLY FIRST EAN from matching article
+        - Trade Numbers (ref_type: 'TRADE')
+        - OEM Numbers (ref_type: 'OE')
+        - Comparable Numbers (ref_type: 'COMPARABLE')
+        - Replacement Numbers (ref_type: 'REPLACEMENT')
+        - Replaced Numbers (ref_type: 'REPLACED')
+        
+        Args:
+            article_id: The original article ID
+            reference_response: Response from get_all_reference_numbers() API call with searchType 10
+            supplier_id: The target manufacturer/supplier ID to filter articles (client requirement)
+            article_number: The target article number to filter articles (client requirement)
+        """
+        if not reference_response or 'articles' not in reference_response:
+            return
+        
+        articles = reference_response.get('articles', [])
+        if not articles:
+            return
+        
+        print(f"   Extracting all reference numbers from {len(articles)} articles...")
+        
+        # Track already added references to avoid duplicates
+        existing_refs = set()
+        for ref in self.csv_data['references']:
+            if ref.get('article_id') == article_id:
+                ref_key = (ref.get('ref_type'), ref.get('number'), ref.get('mfr_name', ''))
+                existing_refs.add(ref_key)
+        
+        ref_count = 0
+        ean_added = False  # Track if we've added the first EAN for this article
+        
+        for article in articles:
+            # CLIENT REQUIREMENT: Filter to only process articles from the target manufacturer
+            # This prevents extracting EANs from comparable items (e.g., Auger, SCT-MANNOL, ST-TEMPLIN)
+            # when processing DT Spare Parts articles
+            article_supplier_id = article.get('dataSupplierId')
+            article_number_from_response = article.get('articleNumber', '')
+            
+            # Skip articles from other manufacturers
+            if supplier_id and article_supplier_id != supplier_id:
+                print(f"   ⊗ Skipping article from different manufacturer (supplier {article_supplier_id}, expected {supplier_id})")
+                continue
+            
+            # Skip comparable articles with different article numbers
+            if article_number and article_number_from_response != article_number:
+                print(f"   ⊗ Skipping comparable article {article_number_from_response} (expected {article_number})")
+                continue
+            # Extract GTINs/EANs - CLIENT REQUIREMENT: Only extract FIRST EAN
+            if 'gtins' in article and article['gtins'] and not ean_added:
+                for gtin in article['gtins']:
+                    if isinstance(gtin, str):
+                        gtin_number = gtin.strip()
+                    else:
+                        gtin_number = str(gtin).strip()
+                    
+                    if gtin_number:
+                        ref_key = ('EAN', gtin_number, '')
+                        if ref_key not in existing_refs:
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'EAN',
+                                'number': gtin_number,
+                                'mfr_name': ''
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            existing_refs.add(ref_key)
+                            ref_count += 1
+                            ean_added = True  # Only add first EAN
+                            print(f"   ✓ Added EAN (first only): {gtin_number}")
+                            break  # Stop after first EAN
+            
+            # Extract Trade Numbers
+            if 'tradeNumbers' in article and article['tradeNumbers']:
+                for trade_num in article['tradeNumbers']:
+                    if isinstance(trade_num, str):
+                        trade_number = trade_num.strip()
+                    else:
+                        trade_number = str(trade_num).strip()
+                    
+                    if trade_number:
+                        ref_key = ('TRADE', trade_number, '')
+                        if ref_key not in existing_refs:
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'TRADE',
+                                'number': trade_number,
+                                'mfr_name': ''
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            existing_refs.add(ref_key)
+                            ref_count += 1
+                            print(f"   ✓ Added Trade Number: {trade_number}")
+            
+            # Extract OEM Numbers (already extracted from main article, but include here for completeness)
+            if 'oemNumbers' in article and article['oemNumbers']:
+                for oem in article['oemNumbers']:
+                    if isinstance(oem, dict):
+                        oem_number = oem.get('articleNumber', '')
+                        mfr_name = oem.get('mfrName', '')
+                    else:
+                        oem_number = str(oem).strip()
+                        mfr_name = ''
+                    
+                    if oem_number:
+                        ref_key = ('OE', oem_number, mfr_name)
+                        if ref_key not in existing_refs:
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'OE',
+                                'number': oem_number,
+                                'mfr_name': mfr_name
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            existing_refs.add(ref_key)
+                            ref_count += 1
+                            print(f"   ✓ Added OE Number: {oem_number} ({mfr_name})")
+            
+            # Extract Comparable Numbers
+            if 'comparableNumbers' in article and article['comparableNumbers']:
+                for comp in article['comparableNumbers']:
+                    if isinstance(comp, dict):
+                        comp_number = comp.get('articleNumber', '')
+                        mfr_name = comp.get('mfrName', '')
+                    else:
+                        comp_number = str(comp).strip()
+                        mfr_name = ''
+                    
+                    if comp_number:
+                        ref_key = ('COMPARABLE', comp_number, mfr_name)
+                        if ref_key not in existing_refs:
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'COMPARABLE',
+                                'number': comp_number,
+                                'mfr_name': mfr_name
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            existing_refs.add(ref_key)
+                            ref_count += 1
+                            print(f"   ✓ Added Comparable Number: {comp_number} ({mfr_name})")
+            
+            # Extract Replacement Numbers
+            if 'replacesArticles' in article and article['replacesArticles']:
+                for repl in article['replacesArticles']:
+                    if isinstance(repl, dict):
+                        repl_number = repl.get('articleNumber', '')
+                        mfr_name = repl.get('mfrName', '')
+                    else:
+                        repl_number = str(repl).strip()
+                        mfr_name = ''
+                    
+                    if repl_number:
+                        ref_key = ('REPLACEMENT', repl_number, mfr_name)
+                        if ref_key not in existing_refs:
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'REPLACEMENT',
+                                'number': repl_number,
+                                'mfr_name': mfr_name
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            existing_refs.add(ref_key)
+                            ref_count += 1
+                            print(f"   ✓ Added Replacement Number: {repl_number} ({mfr_name})")
+            
+            # Extract Replaced Numbers
+            if 'replacedByArticles' in article and article['replacedByArticles']:
+                for replaced in article['replacedByArticles']:
+                    if isinstance(replaced, dict):
+                        replaced_number = replaced.get('articleNumber', '')
+                        mfr_name = replaced.get('mfrName', '')
+                    else:
+                        replaced_number = str(replaced).strip()
+                        mfr_name = ''
+                    
+                    if replaced_number:
+                        ref_key = ('REPLACED', replaced_number, mfr_name)
+                        if ref_key not in existing_refs:
+                            reference_row = {
+                                'article_id': article_id,
+                                'ref_type': 'REPLACED',
+                                'number': replaced_number,
+                                'mfr_name': mfr_name
+                            }
+                            self.csv_data['references'].append(reference_row)
+                            existing_refs.add(ref_key)
+                            ref_count += 1
+                            print(f"   ✓ Added Replaced Number: {replaced_number} ({mfr_name})")
+        
+        if ref_count > 0:
+            print(f"   ✓ Extracted {ref_count} reference numbers total")
     
     def extract_comparable_articles_as_references(self, article_id: int, comparable_response: Dict[str, Any]) -> None:
         """Extract articleNumber and mfrName from comparable numbers search results
@@ -1761,6 +2000,42 @@ class TecdocClient:
             print("WARNING: No vehicles data to export")
             return ""
         
+        # CLIENT REQUIREMENT: Deduplicate vehicles before export
+        # Problem: Duplicate heavy-type vehicle entries (e.g., rows 10368-20655 duplicate rows 80-10367)
+        print(f"   Total vehicles before deduplication: {len(data)}")
+        
+        seen_vehicles = {}
+        deduplicated_data = []
+        
+        for vehicle in data:
+            # Create unique key from key fields
+            unique_key = (
+                vehicle.get('article_id', ''),
+                vehicle.get('vehicle_mfr_name', ''),
+                vehicle.get('model_series_name', ''),
+                vehicle.get('type_name', ''),
+                vehicle.get('year_from', ''),
+                vehicle.get('year_to', ''),
+                vehicle.get('engine_cc', ''),
+                vehicle.get('power_hp', ''),
+                vehicle.get('fuel_type', ''),
+                vehicle.get('body_style', ''),
+                vehicle.get('drive_type', ''),
+                vehicle.get('engine_code', '')
+            )
+            
+            # Keep only first occurrence
+            if unique_key not in seen_vehicles:
+                seen_vehicles[unique_key] = True
+                deduplicated_data.append(vehicle)
+        
+        duplicates_removed = len(data) - len(deduplicated_data)
+        if duplicates_removed > 0:
+            print(f"   ✓ Removed {duplicates_removed} duplicate vehicles")
+        print(f"   Total vehicles after deduplication: {len(deduplicated_data)}")
+        
+        data = deduplicated_data
+        
         try:
             df = pd.DataFrame(data)
             df = df.reindex(columns=vehicles_columns, fill_value='')
@@ -1836,176 +2111,168 @@ class TecdocClient:
             return ""
 
 def main():
-    """Main function"""
+    """Main function - CLIENT REQUIREMENT: Process multiple articles, export once"""
     print("Tecdoc API Export Tool")
     print("=" * 40)
     
     # Initialize client
     client = TecdocClient()
     
-    # Get user input
-    try:
-        print(f"\nTest Data Available:")
-        print(f"   Manufacturer ID: {TEST_MANUFACTURER_ID} (DT Spare Parts)")
-        print(f"   Article Number: {TEST_ARTICLE_NUMBER}")
+    # CLIENT REQUIREMENT: Process multiple articles defined in ARTICLES_TO_PROCESS
+    print(f"\nProcessing {len(ARTICLES_TO_PROCESS)} articles for consolidated export:")
+    for idx, (mfr_id, art_num) in enumerate(ARTICLES_TO_PROCESS, 1):
+        print(f"   {idx}. Manufacturer {mfr_id}, Article {art_num}")
+    print()
+    
+    # Loop through all articles to process
+    for article_index, (manufacturer_id, article_number) in enumerate(ARTICLES_TO_PROCESS, 1):
+        print(f"\n{'='*60}")
+        print(f"ARTICLE {article_index}/{len(ARTICLES_TO_PROCESS)}: Manufacturer {manufacturer_id}, Article {article_number}")
+        print(f"{'='*60}")
+    
+        # Step 1: Get articles with images and GTINs
+        articles_response = client.get_articles(manufacturer_id, article_number)
         
-        # Automatically use test data for demonstration
-        use_test_data = True  # input("\nUse test data? (y/n): ").lower().strip() == 'y'
+        if not articles_response or 'articles' not in articles_response:
+            print(f"ERROR: Failed to retrieve articles for {article_number}")
+            continue  # Skip to next article instead of returning
         
-        if use_test_data:
-            manufacturer_id = TEST_MANUFACTURER_ID
-            article_number = TEST_ARTICLE_NUMBER
-        else:
-            manufacturer_id = int(input("Enter manufacturer ID: "))
-            article_number = input("Enter article number: ").strip()
+        articles_data = articles_response.get('articles', [])
+        
+        if not articles_data:
+            print(f"ERROR: No articles found for {article_number}")
+            continue  # Skip to next article instead of returning
+        
+        print(f"SUCCESS: Found {len(articles_data)} articles")
+    
+        # Step 2: Get article name and ID
+        article_name, article_id = client.get_article_name_and_id(manufacturer_id, article_number)
+        print(f"SUCCESS: Article name: {article_name}")
+        print(f"SUCCESS: Article ID: {article_id}")
+        
+        # Extract assembly group facets from response
+        assembly_group_facets = articles_response.get('assemblyGroupFacets', {})
+        
+        # Step 3: Process articles with complete data extraction
+        for i, article in enumerate(articles_data, 1):
+            print(f"\nProcessing article {i}: {article.get('articleNumber', 'Unknown')}")
             
-        if not article_number:
-            print("ERROR: Article number is required")
-            return
+            # Extract article ID and supplier ID from the new structure
+            article_id = 0
+            supplier_id = article.get('dataSupplierId', 0)
             
-    except ValueError:
-        print("ERROR: Invalid manufacturer ID. Please enter a number.")
-        return
-    
-    print(f"\nProcessing manufacturer {manufacturer_id}, article {article_number}...")
-    
-    # Step 1: Get articles with images and GTINs
-    articles_response = client.get_articles(manufacturer_id, article_number)
-    
-    if not articles_response or 'articles' not in articles_response:
-        print("ERROR: Failed to retrieve articles")
-        return
-    
-    articles_data = articles_response.get('articles', [])
-    
-    if not articles_data:
-        print("ERROR: No articles found")
-        return
-    
-    print(f"SUCCESS: Found {len(articles_data)} articles")
-    
-    # Step 2: Get article name and ID
-    article_name, article_id = client.get_article_name_and_id(manufacturer_id, article_number)
-    print(f"SUCCESS: Article name: {article_name}")
-    print(f"SUCCESS: Article ID: {article_id}")
-    
-    # Extract assembly group facets from response
-    assembly_group_facets = articles_response.get('assemblyGroupFacets', {})
-    
-    # Step 3: Process articles with complete data extraction
-    for i, article in enumerate(articles_data, 1):
-        print(f"\nProcessing article {i}: {article.get('articleNumber', 'Unknown')}")
-        
-        # Extract article ID and supplier ID from the new structure
-        article_id = 0
-        supplier_id = article.get('dataSupplierId', 0)
-        
-        # Get legacy article ID from genericArticles if available
-        if 'genericArticles' in article and article['genericArticles']:
-            legacy_article_id = article['genericArticles'][0].get('legacyArticleId', 0)
-            if legacy_article_id:
-                article_id = legacy_article_id
-        
-        # Process complete article data with assembly group facets
-        article_number_from_data = article.get('articleNumber', article_number)
-        client.process_complete_article_data(article, article_name, article_id, supplier_id, assembly_group_facets, article_number_from_data)
-        
-        # Show key information
-        print(f"   Name: {article_name}")
-        print(f"   Manufacturer: {article.get('mfrName', 'Unknown')}")
-        print(f"   Article ID: {article_id}")
-        print(f"   Supplier ID: {supplier_id}")
-        print(f"   Article Number: {article.get('articleNumber', 'Unknown')}")
-        
-        # Step 3b: Get and process vehicle linkages for this article
-        if article_id:
-            # Configure vehicle types to process (can be changed as needed)
-            # P = Passenger cars, O = CV + Tractor, V = Commercial vehicles, C = Both P+V
-            # M = Motorcycles, A = Axles
-            vehicle_types_to_process = ['P', 'O', 'V', 'C', 'M', 'A']  # Process all vehicle types
+            # Get legacy article ID from genericArticles if available
+            if 'genericArticles' in article and article['genericArticles']:
+                legacy_article_id = article['genericArticles'][0].get('legacyArticleId', 0)
+                if legacy_article_id:
+                    article_id = legacy_article_id
             
-            for vehicle_type in vehicle_types_to_process:
-                print(f"\n   Processing vehicle type: {vehicle_type}")
+            # Process complete article data with assembly group facets
+            article_number_from_data = article.get('articleNumber', article_number)
+            client.process_complete_article_data(article, article_name, article_id, supplier_id, assembly_group_facets, article_number_from_data)
+            
+            # Show key information
+            print(f"   Name: {article_name}")
+            print(f"   Manufacturer: {article.get('mfrName', 'Unknown')}")
+            print(f"   Article ID: {article_id}")
+            print(f"   Supplier ID: {supplier_id}")
+            print(f"   Article Number: {article.get('articleNumber', 'Unknown')}")
+        
+            # Step 3b: Get and process vehicle linkages for this article
+            if article_id:
+                # Configure vehicle types to process (can be changed as needed)
+                # P = Passenger cars, O = CV + Tractor, V = Commercial vehicles, C = Both P+V
+                # M = Motorcycles, A = Axles
+                vehicle_types_to_process = ['P', 'O', 'V', 'C', 'M', 'A']  # Process all vehicle types
                 
-                # NEW 3-STEP APPROACH (as per client requirements)
-                # Step 1: Get linked manufacturers
-                manufacturers_response = client.get_linked_manufacturers(article_id, vehicle_type)
-                
-                if not manufacturers_response or 'data' not in manufacturers_response:
-                    print(f"   No manufacturers found for vehicle type {vehicle_type}")
-                    continue
-                
-                manufacturers_data = manufacturers_response.get('data', {})
-                if 'array' not in manufacturers_data:
-                    print(f"   No manufacturers array found for vehicle type {vehicle_type}")
-                    continue
-                
-                manufacturers = manufacturers_data['array']
-                print(f"   Found {len(manufacturers)} linked manufacturers")
-                
-                # Step 2 & 3: For each manufacturer, get linkages and then vehicle details
-                for mfr in manufacturers:
-                    mfr_id = mfr.get('manuId')
-                    mfr_name = mfr.get('manuName', 'Unknown')
+                for vehicle_type in vehicle_types_to_process:
+                    print(f"\n   Processing vehicle type: {vehicle_type}")
                     
-                    if not mfr_id:
+                    # NEW 3-STEP APPROACH (as per client requirements)
+                    # Step 1: Get linked manufacturers
+                    manufacturers_response = client.get_linked_manufacturers(article_id, vehicle_type)
+                    
+                    if not manufacturers_response or 'data' not in manufacturers_response:
+                        print(f"   No manufacturers found for vehicle type {vehicle_type}")
                         continue
                     
-                    print(f"   Processing manufacturer: {mfr_name} (ID: {mfr_id})")
-                    
-                    # Step 2: Get linkages for this manufacturer
-                    linkages_response = client.get_linkages_by_manufacturer(article_id, mfr_id, vehicle_type)
-                    
-                    if not linkages_response or 'data' not in linkages_response:
-                        print(f"      No linkages found for manufacturer {mfr_name}")
+                    manufacturers_data = manufacturers_response.get('data', {})
+                    if 'array' not in manufacturers_data:
+                        print(f"   No manufacturers array found for vehicle type {vehicle_type}")
                         continue
                     
-                    linkages_data = linkages_response.get('data', {})
-                    if 'array' not in linkages_data:
-                        print(f"      No linkages array found for manufacturer {mfr_name}")
-                        continue
+                    manufacturers = manufacturers_data['array']
+                    print(f"   Found {len(manufacturers)} linked manufacturers")
                     
-                    # Extract linkage pairs from the response
-                    all_linkage_pairs = client.extract_linkage_pairs(linkages_response)
-                    
-                    if not all_linkage_pairs:
-                        print(f"      No linkage pairs found for manufacturer {mfr_name}")
-                        continue
-                    
-                    print(f"      Found {len(all_linkage_pairs)} linkage pairs")
-                    
-                    # Step 3: Get detailed vehicle data in batches (API limit is 25 pairs per request)
-                    batch_size = 25
-                    for i in range(0, len(all_linkage_pairs), batch_size):
-                        batch = all_linkage_pairs[i:i+batch_size]
-                        print(f"      Fetching batch {i//batch_size + 1}/{(len(all_linkage_pairs)-1)//batch_size + 1} ({len(batch)} linkages)...")
+                    # Step 2 & 3: For each manufacturer, get linkages and then vehicle details
+                    for mfr in manufacturers:
+                        mfr_id = mfr.get('manuId')
+                        mfr_name = mfr.get('manuName', 'Unknown')
                         
-                        # Create map: articleLinkId -> linkingTargetId for enrichment
-                        linkage_pairs_map = {pair['articleLinkId']: pair['linkingTargetId'] for pair in batch}
+                        if not mfr_id:
+                            continue
                         
-                        # Get full vehicle details using the linkage pairs
-                        detailed_response = client.get_detailed_linkages(article_id, batch, vehicle_type)
-                        if detailed_response:
-                            client.process_vehicle_linkages(article_id, detailed_response, linkage_pairs_map)
-                
-                # After all manufacturers are processed, enrich vehicles with linkage target details
-                if ENABLE_VEHICLE_ENRICHMENT:
-                    if client.vehicle_lookup:
-                        print(f"   Enriching vehicles for type {vehicle_type}...")
-                        client.enrich_vehicles_with_linkage_targets(vehicle_type)
+                        print(f"   Processing manufacturer: {mfr_name} (ID: {mfr_id})")
+                        
+                        # Step 2: Get linkages for this manufacturer
+                        linkages_response = client.get_linkages_by_manufacturer(article_id, mfr_id, vehicle_type)
+                        
+                        if not linkages_response or 'data' not in linkages_response:
+                            print(f"      No linkages found for manufacturer {mfr_name}")
+                            continue
+                        
+                        linkages_data = linkages_response.get('data', {})
+                        if 'array' not in linkages_data:
+                            print(f"      No linkages array found for manufacturer {mfr_name}")
+                            continue
+                        
+                        # Extract linkage pairs from the response
+                        all_linkage_pairs = client.extract_linkage_pairs(linkages_response)
+                        
+                        if not all_linkage_pairs:
+                            print(f"      No linkage pairs found for manufacturer {mfr_name}")
+                            continue
+                        
+                        print(f"      Found {len(all_linkage_pairs)} linkage pairs")
+                        
+                        # Step 3: Get detailed vehicle data in batches (API limit is 25 pairs per request)
+                        batch_size = 25
+                        for i in range(0, len(all_linkage_pairs), batch_size):
+                            batch = all_linkage_pairs[i:i+batch_size]
+                            print(f"      Fetching batch {i//batch_size + 1}/{(len(all_linkage_pairs)-1)//batch_size + 1} ({len(batch)} linkages)...")
+                            
+                            # Create map: articleLinkId -> linkingTargetId for enrichment
+                            linkage_pairs_map = {pair['articleLinkId']: pair['linkingTargetId'] for pair in batch}
+                            
+                            # Get full vehicle details using the linkage pairs
+                            detailed_response = client.get_detailed_linkages(article_id, batch, vehicle_type)
+                            if detailed_response:
+                                client.process_vehicle_linkages(article_id, detailed_response, linkage_pairs_map)
+                    
+                    # After all manufacturers are processed, enrich vehicles with linkage target details
+                    if ENABLE_VEHICLE_ENRICHMENT:
+                        if client.vehicle_lookup:
+                            print(f"   Enriching vehicles for type {vehicle_type}...")
+                            client.enrich_vehicles_with_linkage_targets(vehicle_type)
+                        else:
+                            print(f"   WARNING: No vehicles in lookup for type {vehicle_type}, skipping enrichment")
                     else:
-                        print(f"   WARNING: No vehicles in lookup for type {vehicle_type}, skipping enrichment")
-                else:
-                    # Skip enrichment, add vehicles directly to CSV
-                    if client.vehicle_lookup:
-                        for vehicle_list in client.vehicle_lookup.values():
-                            for vehicle_info in vehicle_list:
-                                client.csv_data['vehicles'].append(vehicle_info['row'])
-                        client.vehicle_lookup.clear()
-                        print(f"   Skipped enrichment (ENABLE_VEHICLE_ENRICHMENT=False)")
+                        # Skip enrichment, add vehicles directly to CSV
+                        if client.vehicle_lookup:
+                            for vehicle_list in client.vehicle_lookup.values():
+                                for vehicle_info in vehicle_list:
+                                    client.csv_data['vehicles'].append(vehicle_info['row'])
+                            client.vehicle_lookup.clear()
+                            print(f"   Skipped enrichment (ENABLE_VEHICLE_ENRICHMENT=False)")
+    
+    # CLIENT REQUIREMENT: All articles processed - now export consolidated data
+    print(f"\n{'='*60}")
+    print(f"All {len(ARTICLES_TO_PROCESS)} articles processed!")
+    print(f"Creating consolidated CSV exports...")
+    print(f"{'='*60}\n")
     
     # Step 4: Export to articles.csv (focused export)
-    print(f"\nExporting to articles.csv...")
+    print(f"Exporting to articles.csv...")
     created_file = client.export_articles_csv()
     
     # Step 5: Export to attributes.csv

@@ -40,6 +40,7 @@ ARTICLES_TO_PROCESS = [
     (355, "5.15025"),   # DT Spare Parts - Sensor, Kraftstoffvorrat
     (205, "38953"),     # NRF - Test passenger car (Type P) data
     (80, "860168N"),    # AKS Dasis - Test passenger car (Type P) data
+    (205, "32146"),     # NRF - Test vehicle restrictions (PR numbers, dates, etc.)
 ]
 
 # Enrichment Settings
@@ -1587,6 +1588,26 @@ class TecdocClient:
                 article_link_id = item.get('articleLinkId', '')
                 linking_target_id = item.get('linkingTargetId', '')
                 
+                # CLIENT REQUIREMENT: Extract immediate attributes (restrictions like PR numbers, dates, etc.)
+                immediate_restrictions = []
+                if 'linkedArticleImmediateAttributs' in item:
+                    immediate_attrs = item['linkedArticleImmediateAttributs']
+                    if isinstance(immediate_attrs, dict) and 'array' in immediate_attrs:
+                        for attr in immediate_attrs['array']:
+                            if isinstance(attr, dict):
+                                attr_name = attr.get('attrName', '')
+                                attr_value = attr.get('attrValue', '')
+                                if attr_value:
+                                    # Format: "attrName: attrValue"
+                                    immediate_restrictions.append(f"{attr_name}: {attr_value}")
+                    elif isinstance(immediate_attrs, list):
+                        for attr in immediate_attrs:
+                            if isinstance(attr, dict):
+                                attr_name = attr.get('attrName', '')
+                                attr_value = attr.get('attrValue', '')
+                                if attr_value:
+                                    immediate_restrictions.append(f"{attr_name}: {attr_value}")
+                
                 if 'linkedVehicles' in item:
                     linked_vehicles = item['linkedVehicles']
                     if isinstance(linked_vehicles, dict) and 'array' in linked_vehicles:
@@ -1594,12 +1615,14 @@ class TecdocClient:
                             vehicle['_articleLinkId'] = article_link_id  # Store for mapping
                             vehicle['_linkingTargetId'] = linking_target_id  # Store for enrichment
                             vehicle['_constructionType'] = vehicle.get('constructionType', '')  # Store for fallback body_style
+                            vehicle['_immediateRestrictions'] = immediate_restrictions  # Store restrictions (PR numbers, etc.)
                             actual_vehicles.append(vehicle)
                     elif isinstance(linked_vehicles, list):
                         for vehicle in linked_vehicles:
                             vehicle['_articleLinkId'] = article_link_id  # Store for mapping
                             vehicle['_linkingTargetId'] = linking_target_id  # Store for enrichment
                             vehicle['_constructionType'] = vehicle.get('constructionType', '')  # Store for fallback body_style
+                            vehicle['_immediateRestrictions'] = immediate_restrictions  # Store restrictions (PR numbers, etc.)
                             actual_vehicles.append(vehicle)
         
         if not actual_vehicles:
@@ -1628,6 +1651,10 @@ class TecdocClient:
             # Get constructionType for fallback body_style
             construction_type = vehicle.get('_constructionType', vehicle.get('constructionType', ''))
             
+            # CLIENT REQUIREMENT: Get immediate restrictions (PR numbers, Fahrzeugtyp, dates, etc.)
+            immediate_restrictions = vehicle.get('_immediateRestrictions', [])
+            immediate_restrictions_str = ' | '.join(immediate_restrictions) if immediate_restrictions else ''
+            
             vehicle_row = {
                 'article_id': article_id,
                 'vehicle_mfr_name': vehicle.get('manuDesc', ''),
@@ -1642,7 +1669,7 @@ class TecdocClient:
                 'drive_type': '',  # Will be enriched from getLinkageTargets
                 'kba_numbers': '',  # Will be enriched from getLinkageTargets
                 'engine_code': '',  # Will be enriched from getLinkageTargets
-                'other_restrictions': ''  # Will be enriched from getLinkageTargets
+                'other_restrictions': immediate_restrictions_str  # Immediate restrictions from API (PR numbers, etc.)
             }
             
             # Store vehicle with linkingTargetId for enrichment
@@ -1862,7 +1889,18 @@ class TecdocClient:
                     vehicle_row['drive_type'] = linkage_target.get('driveType', '') or vehicle_row.get('drive_type', '')
                     vehicle_row['kba_numbers'] = '|'.join(kba_numbers) if kba_numbers else vehicle_row.get('kba_numbers', '')
                     vehicle_row['engine_code'] = '|'.join(engine_codes) if engine_codes else vehicle_row.get('engine_code', '')
-                    vehicle_row['other_restrictions'] = '|'.join(restrictions) if restrictions else vehicle_row.get('other_restrictions', '')
+                    
+                    # CLIENT REQUIREMENT: Combine immediate restrictions (PR numbers) with enrichment restrictions
+                    existing_restrictions = vehicle_row.get('other_restrictions', '')
+                    enrichment_restrictions = '|'.join(restrictions) if restrictions else ''
+                    
+                    # Combine both sources, avoiding duplicates
+                    all_restrictions = []
+                    if existing_restrictions:
+                        all_restrictions.append(existing_restrictions)
+                    if enrichment_restrictions:
+                        all_restrictions.append(enrichment_restrictions)
+                    vehicle_row['other_restrictions'] = ' | '.join(all_restrictions) if all_restrictions else ''
                 
                 # Always add vehicle to CSV data, even if enrichment failed
                 self.csv_data['vehicles'].append(vehicle_row)

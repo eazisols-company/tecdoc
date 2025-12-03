@@ -100,6 +100,8 @@ class TecdocClient:
                 "includeReplacedByArticles": True,
                 "includeReplacesArticles": True,
                 "includeGTINs": True,
+                "includeArticleText": True,  # CLIENT REQUIREMENT: Get article text (technical information)
+                "includeAdditionalDescription": True,  # CLIENT REQUIREMENT: Get additional description (e.g., "EASY FIT")
                 "assemblyGroupFacetOptions": {
                     "enabled": True,
                     "assemblyGroupType": "O",
@@ -606,6 +608,54 @@ class TecdocClient:
         if 'articleCriteria' in article or 'attributes' in article or 'criteria' in article:
             print(f"   Found attributes in article data, processing...")
             self.extract_attributes_from_article(article_id, article)
+        
+        # CLIENT REQUIREMENT: Extract additionalDescription (e.g., "EASY FIT")
+        if 'additionalDescription' in article and article['additionalDescription']:
+            additional_desc = article['additionalDescription']
+            attribute_row = {
+                'article_id': article_id,
+                'criteria_id': 'additionalDescription',
+                'criteria_description': 'Additional Description',
+                'criteria_abbr': 'Additional Desc',
+                'value_raw': additional_desc,
+                'value_formatted': additional_desc,
+                'unit': '',
+                'immediate_display': 'true',
+                'is_interval': 'false'
+            }
+            self.csv_data['attributes'].append(attribute_row)
+            print(f"   ✓ Added additionalDescription: {additional_desc}")
+        
+        # CLIENT REQUIREMENT: Extract articleText (Technical information, etc.)
+        if 'articleText' in article and article['articleText']:
+            article_texts = article['articleText']
+            if isinstance(article_texts, list):
+                for text_item in article_texts:
+                    if isinstance(text_item, dict):
+                        info_type_key = text_item.get('informationTypeKey', '')
+                        info_type_desc = text_item.get('informationTypeDescription', 'Article Text')
+                        text_array = text_item.get('text', [])
+                        
+                        # Join text array into single string
+                        if isinstance(text_array, list):
+                            text_value = ' '.join(text_array)
+                        else:
+                            text_value = str(text_array)
+                        
+                        if text_value:
+                            attribute_row = {
+                                'article_id': article_id,
+                                'criteria_id': f'articleText_{info_type_key}',
+                                'criteria_description': info_type_desc,
+                                'criteria_abbr': info_type_desc,
+                                'value_raw': text_value,
+                                'value_formatted': text_value,
+                                'unit': '',
+                                'immediate_display': str(text_item.get('isImmediateDisplay', True)).lower(),
+                                'is_interval': 'false'
+                            }
+                            self.csv_data['attributes'].append(attribute_row)
+                            print(f"   ✓ Added articleText: {info_type_desc[:50]}...")
         
         # Extract OE references (articleNumber and mfrName) from the main article data
         if 'oemNumbers' in article and article['oemNumbers']:
@@ -1590,6 +1640,9 @@ class TecdocClient:
                 
                 # CLIENT REQUIREMENT: Extract immediate attributes (restrictions like PR numbers, dates, etc.)
                 immediate_restrictions = []
+                date_from = []  # Collect "Baujahr ab" values
+                date_to = []    # Collect "Baujahr bis" values
+                
                 if 'linkedArticleImmediateAttributs' in item:
                     immediate_attrs = item['linkedArticleImmediateAttributs']
                     if isinstance(immediate_attrs, dict) and 'array' in immediate_attrs:
@@ -1598,15 +1651,47 @@ class TecdocClient:
                                 attr_name = attr.get('attrName', '')
                                 attr_value = attr.get('attrValue', '')
                                 if attr_value:
-                                    # Format: "attrName: attrValue"
-                                    immediate_restrictions.append(f"{attr_name}: {attr_value}")
+                                    # CLIENT REQUIREMENT: Group date restrictions intelligently
+                                    if attr_name == 'Baujahr ab':
+                                        date_from.append(attr_value)
+                                    elif attr_name == 'Baujahr bis':
+                                        date_to.append(attr_value)
+                                    else:
+                                        # Format: "attrName: attrValue"
+                                        immediate_restrictions.append(f"{attr_name}: {attr_value}")
                     elif isinstance(immediate_attrs, list):
                         for attr in immediate_attrs:
                             if isinstance(attr, dict):
                                 attr_name = attr.get('attrName', '')
                                 attr_value = attr.get('attrValue', '')
                                 if attr_value:
-                                    immediate_restrictions.append(f"{attr_name}: {attr_value}")
+                                    # CLIENT REQUIREMENT: Group date restrictions intelligently
+                                    if attr_name == 'Baujahr ab':
+                                        date_from.append(attr_value)
+                                    elif attr_name == 'Baujahr bis':
+                                        date_to.append(attr_value)
+                                    else:
+                                        immediate_restrictions.append(f"{attr_name}: {attr_value}")
+                
+                # CLIENT REQUIREMENT: Group date ranges intelligently
+                # If we have both "from" and "to" dates, pair them up as ranges
+                if date_from and date_to:
+                    # Try to pair them up (e.g., "201411-201601", "201706-201802")
+                    for i in range(min(len(date_from), len(date_to))):
+                        immediate_restrictions.append(f"Baujahr: {date_from[i]}-{date_to[i]}")
+                    # Add remaining unpaired dates
+                    for i in range(len(date_to), len(date_from)):
+                        immediate_restrictions.append(f"Baujahr ab: {date_from[i]}")
+                    for i in range(len(date_from), len(date_to)):
+                        immediate_restrictions.append(f"Baujahr bis: {date_to[i]}")
+                elif date_from:
+                    # Only "from" dates
+                    for val in date_from:
+                        immediate_restrictions.append(f"Baujahr ab: {val}")
+                elif date_to:
+                    # Only "to" dates
+                    for val in date_to:
+                        immediate_restrictions.append(f"Baujahr bis: {val}")
                 
                 if 'linkedVehicles' in item:
                     linked_vehicles = item['linkedVehicles']
@@ -1637,13 +1722,26 @@ class TecdocClient:
             
             # Extract power HP (use range if available)
             power_hp = ''
+            power_kw = ''  # CLIENT REQUIREMENT: Add power in kW
             if 'powerHpFrom' in vehicle:
                 power_from = vehicle.get('powerHpFrom', '')
                 power_to = vehicle.get('powerHpTo', '')
                 if power_from and power_to and power_from != power_to:
                     power_hp = f"{power_from}-{power_to}"
+                    # Convert to kW: 1 HP = 0.7355 kW
+                    try:
+                        kw_from = int(float(power_from) * 0.7355)
+                        kw_to = int(float(power_to) * 0.7355)
+                        power_kw = f"{kw_from}-{kw_to}"
+                    except (ValueError, TypeError):
+                        power_kw = ''
                 elif power_from:
                     power_hp = str(power_from)
+                    # Convert to kW
+                    try:
+                        power_kw = str(int(float(power_from) * 0.7355))
+                    except (ValueError, TypeError):
+                        power_kw = ''
             
             # Get linkingTargetId for enrichment
             linking_target_id = vehicle.get('_linkingTargetId') or vehicle.get('carId', '')
@@ -1664,6 +1762,7 @@ class TecdocClient:
                 'year_to': year_to,
                 'engine_cc': str(vehicle.get('cylinderCapacity', '')) if vehicle.get('cylinderCapacity') else '',
                 'power_hp': power_hp,
+                'power_kw': power_kw,  # CLIENT REQUIREMENT: Power in kW
                 'fuel_type': '',  # Will be enriched from getLinkageTargets
                 'body_style': construction_type,  # Use constructionType as fallback, will be enriched if available
                 'drive_type': '',  # Will be enriched from getLinkageTargets
@@ -2025,10 +2124,10 @@ class TecdocClient:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"vehicles_{timestamp}.csv"
         
-        # Define vehicles CSV schema according to client requirements (14 columns)
+        # Define vehicles CSV schema according to client requirements (15 columns - added power_kw)
         vehicles_columns = [
             'article_id', 'vehicle_mfr_name', 'model_series_name', 'type_name',
-            'year_from', 'year_to', 'engine_cc', 'power_hp', 'fuel_type',
+            'year_from', 'year_to', 'engine_cc', 'power_hp', 'power_kw', 'fuel_type',
             'body_style', 'drive_type', 'kba_numbers', 'engine_code', 'other_restrictions'
         ]
         

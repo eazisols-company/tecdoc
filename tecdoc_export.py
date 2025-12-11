@@ -42,7 +42,8 @@ ARTICLES_TO_PROCESS = [
     (80, "860168N"),    # AKS Dasis - Test passenger car (Type P) data
     (205, "32146"),     # NRF - Test vehicle restrictions (PR numbers, dates, etc.)
     (101, "34322"),     # FEBI BILSTEIN - Test accessory list extraction (CLIENT REQUIREMENT)
-    # (205, "74687015"),  # NRF - Test additionalDescription "EASY FIT" (CLIENT REQUIREMENT) - DISABLED: needs legacyArticleId from getArticles first
+    (225, "CH9701"),    # Trade Numbers extraction test
+    (101, "32146"),     # NRF - Test additionalDescription "EASY FIT" (CLIENT REQUIREMENT) - DISABLED: needs legacyArticleId from getArticles first
 ]
 
 # Enrichment Settings
@@ -1243,8 +1244,10 @@ class TecdocClient:
         # Extract mfrId
         mfr_id = str(article.get('mfrId', ''))
         
-        # Extract additionalDescription (CLIENT REQUIREMENT: e.g., "EASY FIT")
-        additional_description = article.get('additionalDescription', '')
+        # Extract additionalDescription from misc object (CLIENT REQUIREMENT: e.g., "EASY FIT")
+        additional_description = ''
+        if 'misc' in article and article['misc']:
+            additional_description = article['misc'].get('additionalDescription', '')
         
         # Create article row according to schema
         article_row = {
@@ -1710,6 +1713,7 @@ class TecdocClient:
         
         Extracts accessory relationships and stores them as attribute entries.
         Each accessory becomes a row in attributes.csv with type "Accessory".
+        Now stores ALL fields in dedicated columns instead of concatenated string.
         
         Args:
             article_id: The main article ID
@@ -1746,50 +1750,76 @@ class TecdocClient:
             if not details:
                 continue
             
-            # Extract key fields
-            accessory_article_id = details.get('accessoryArticleId', '')
-            accessory_link_id = details.get('accessoryLinkId', '')
+            # Extract ALL fields from accessory details (CLIENT REQUIREMENT: Complete data in separate columns)
+            accessory_article_id = str(details.get('accessoryArticleId', ''))
+            accessory_link_id = str(details.get('accessoryLinkId', ''))
             article_name = details.get('articleName', '')
             article_no = details.get('articleNo', '')
+            article_add_name = details.get('articleAddName', '')  # e.g., "febi Plus"
+            article_list_no = str(details.get('articleListNo', ''))
+            article_state = str(details.get('articleState', ''))
+            article_state_name = details.get('articleStateName', '')  # e.g., "Normal"
             brand_name = details.get('brandName', '')
-            brand_no = details.get('brandNo', '')
+            brand_no = str(details.get('brandNo', ''))
+            generic_article_id = str(details.get('genericArticleId', ''))
             generic_article_name = details.get('genericArticleName', '')
-            quantity = details.get('quantity', '')
+            quantity = str(details.get('quantity', ''))
+            packing_unit = str(details.get('packingUnit', ''))
             
-            # Build attribute value with all relevant information
-            value_parts = []
-            if article_no:
-                value_parts.append(f"Article: {article_no}")
-            if brand_name:
-                value_parts.append(f"Brand: {brand_name}")
-            if generic_article_name and generic_article_name != article_name:
-                value_parts.append(f"Type: {generic_article_name}")
-            if quantity:
-                value_parts.append(f"Qty: {quantity}")
-            if accessory_article_id:
-                value_parts.append(f"ID: {accessory_article_id}")
+            # Extract boolean flags (convert to string for CSV)
+            has_axle_link = str(details.get('hasAxleLink', False)).lower()
+            has_documents = str(details.get('hasDocuments', False)).lower()
+            has_mark_link = str(details.get('hasMarkLink', False)).lower()
+            has_motor_link = str(details.get('hasMotorLink', False)).lower()
+            has_oen = str(details.get('hasOEN', False)).lower()
+            has_part_list = str(details.get('hasPartList', False)).lower()
+            has_prices = str(details.get('hasPrices', False)).lower()
+            has_security_info = str(details.get('hasSecurityInfo', False)).lower()
+            has_vehicle_link = str(details.get('hasVehicleLink', False)).lower()
             
-            attribute_value = ' | '.join(value_parts) if value_parts else ''
-            
-            # Create attribute row for accessories
-            # Using the existing attributes CSV structure
+            # Create attribute row with dedicated accessory columns
+            # CLIENT REQUIREMENT: Separate columns for each accessory field
             accessory_row = {
                 'article_id': article_id,
                 'criteria_id': f'accessory_{accessory_link_id}' if accessory_link_id else f'accessory_{idx+1}',
                 'criteria_description': 'Accessory',
                 'criteria_abbr': 'ACC',
                 'value_raw': article_name,
-                'value_formatted': attribute_value,
+                'value_formatted': f"{article_name} ({article_no})",  # Simple formatted version
                 'unit': '',
                 'immediate_display': 'true',
-                'is_interval': 'false'
+                'is_interval': 'false',
+                # Dedicated accessory columns (CLIENT REQUIREMENT)
+                'accessory_article_id': accessory_article_id,
+                'accessory_link_id': accessory_link_id,
+                'accessory_article_no': article_no,
+                'accessory_article_name': article_name,
+                'accessory_article_add_name': article_add_name,
+                'accessory_brand_name': brand_name,
+                'accessory_brand_no': brand_no,
+                'accessory_generic_article_id': generic_article_id,
+                'accessory_generic_article_name': generic_article_name,
+                'accessory_quantity': quantity,
+                'accessory_packing_unit': packing_unit,
+                'accessory_article_state': article_state,
+                'accessory_article_state_name': article_state_name,
+                'accessory_article_list_no': article_list_no,
+                'accessory_has_documents': has_documents,
+                'accessory_has_oen': has_oen,
+                'accessory_has_part_list': has_part_list,
+                'accessory_has_vehicle_link': has_vehicle_link,
+                'accessory_has_prices': has_prices,
+                'accessory_has_axle_link': has_axle_link,
+                'accessory_has_motor_link': has_motor_link,
+                'accessory_has_mark_link': has_mark_link,
+                'accessory_has_security_info': has_security_info
             }
             
             self.csv_data['attributes'].append(accessory_row)
             accessory_count += 1
             print(f"   ✓ Added accessory: {article_name} ({article_no})")
         
-        print(f"   ✓ Processed {accessory_count} accessories into attributes.csv")
+        print(f"   ✓ Processed {accessory_count} accessories into attributes.csv with dedicated columns")
     
     def process_vehicle_linkages(self, article_id: int, linkages_response: Dict[str, Any], linkage_pairs_map: Dict[int, int] = None) -> None:
         """Process vehicle linkages for vehicles.csv
@@ -2245,10 +2275,20 @@ class TecdocClient:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"attributes_{timestamp}.csv"
         
-        # Define attributes CSV schema according to client requirements
+        # Define attributes CSV schema (CLIENT REQUIREMENT: includes dedicated accessory columns)
         attributes_columns = [
+            # Core attribute columns
             'article_id', 'criteria_id', 'criteria_description', 'criteria_abbr',
-            'value_raw', 'value_formatted', 'unit', 'immediate_display', 'is_interval'
+            'value_raw', 'value_formatted', 'unit', 'immediate_display', 'is_interval',
+            # Dedicated accessory columns (CLIENT REQUIREMENT: separate columns instead of concatenated string)
+            'accessory_article_id', 'accessory_link_id', 'accessory_article_no',
+            'accessory_article_name', 'accessory_article_add_name', 'accessory_brand_name',
+            'accessory_brand_no', 'accessory_generic_article_id', 'accessory_generic_article_name',
+            'accessory_quantity', 'accessory_packing_unit', 'accessory_article_state',
+            'accessory_article_state_name', 'accessory_article_list_no',
+            'accessory_has_documents', 'accessory_has_oen', 'accessory_has_part_list',
+            'accessory_has_vehicle_link', 'accessory_has_prices', 'accessory_has_axle_link',
+            'accessory_has_motor_link', 'accessory_has_mark_link', 'accessory_has_security_info'
         ]
         
         data = self.csv_data['attributes']
@@ -2259,12 +2299,17 @@ class TecdocClient:
         
         try:
             df = pd.DataFrame(data)
+            # Reindex to ensure all columns exist (fill missing accessory columns with empty strings for regular attributes)
             df = df.reindex(columns=attributes_columns, fill_value='')
             
             # Export with semicolon delimiter as per client requirements
             df.to_csv(filename, index=False, encoding='utf-8', sep=';')
             
-            print(f"SUCCESS: attributes.csv created: {len(data)} records")
+            # Count regular attributes vs accessories
+            regular_count = len([d for d in data if d.get('criteria_description') != 'Accessory'])
+            accessory_count = len([d for d in data if d.get('criteria_description') == 'Accessory'])
+            
+            print(f"SUCCESS: attributes.csv created: {len(data)} records ({regular_count} attributes, {accessory_count} accessories)")
             print(f"File: {filename}")
             
             return filename

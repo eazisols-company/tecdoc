@@ -41,6 +41,8 @@ ARTICLES_TO_PROCESS = [
     (205, "38953"),     # NRF - Test passenger car (Type P) data
     (80, "860168N"),    # AKS Dasis - Test passenger car (Type P) data
     (205, "32146"),     # NRF - Test vehicle restrictions (PR numbers, dates, etc.)
+    (101, "34322"),     # FEBI BILSTEIN - Test accessory list extraction (CLIENT REQUIREMENT)
+    # (205, "74687015"),  # NRF - Test additionalDescription "EASY FIT" (CLIENT REQUIREMENT) - DISABLED: needs legacyArticleId from getArticles first
 ]
 
 # Enrichment Settings
@@ -227,17 +229,18 @@ class TecdocClient:
         return 'N/A', ''
     
     def get_brand_info(self, supplier_id: int) -> Dict[str, Any]:
-        """Get brand information"""
+        """Get brand information using getBrands API (CLIENT REQUIREMENT)"""
         payload = {
-            "getBrandInfo": {
+            "getBrands": {
                 "articleCountry": DEFAULT_COUNTRY,
-                "supplierId": supplier_id,
                 "lang": DEFAULT_LANGUAGE,
-                "provider": TECDOC_PROVIDER
+                "provider": TECDOC_PROVIDER,
+                "includeAll": True,
+                "dataSupplierIds": [supplier_id]
             }
         }
         
-        print(f"Getting brand info for supplier ID {supplier_id}...")
+        print(f"   Getting brand info for supplier ID {supplier_id}...")
         return self.make_request(payload)
     
     def get_article_classification(self, article_id: int) -> Dict[str, Any]:
@@ -449,6 +452,54 @@ class TecdocClient:
         
         print(f"   Trying to get linkage targets by IDs ({len(linkage_target_ids)} IDs)...")
         return self.make_request(payload)
+    
+    def get_article_accessory_list(self, article_id: int) -> Optional[Dict[str, Any]]:
+        """Get accessory list for an article (CLIENT REQUIREMENT)
+        
+        Retrieves related/recommended accessories for an article.
+        Example: For Febi article 34322, returns inspection kits and related parts.
+        
+        Args:
+            article_id: The TecDoc article ID (legacyArticleId)
+            
+        Returns:
+            API response containing accessory list, or None if error/empty
+        """
+        payload = {
+            "getArticleAccessoryList4": {
+                "provider": TECDOC_PROVIDER,
+                "articleCountry": DEFAULT_COUNTRY,
+                "lang": DEFAULT_LANGUAGE,
+                "articleId": article_id
+            }
+        }
+        
+        print(f"   📦 Getting accessory list for article {article_id}...")
+        response = self.make_request(payload)
+        
+        if response and response.get('status') == 200:
+            data = response.get('data', {})
+            if data:
+                if isinstance(data, dict) and 'array' in data:
+                    accessory_count = len(data.get('array', []))
+                elif isinstance(data, list):
+                    accessory_count = len(data)
+                else:
+                    accessory_count = 0
+                
+                if accessory_count > 0:
+                    print(f"   ✓ Found {accessory_count} accessories")
+                    return response
+                else:
+                    print(f"   ⚠ No accessories found (empty response)")
+                    return None
+            else:
+                print(f"   ⚠ No accessories found (no data)")
+                return None
+        else:
+            status = response.get('status') if response else 'No response'
+            print(f"   ⚠ Accessory list request failed (status: {status})")
+            return None
     
     def extract_image_urls(self, images_data: List[Dict[str, Any]]) -> Dict[str, str]:
         """Extract image URLs from images list"""
@@ -671,6 +722,14 @@ class TecdocClient:
             reference_response = self.get_all_reference_numbers(article_number_from_data, [generic_article_id])
             if reference_response and 'articles' in reference_response:
                 self.extract_all_reference_numbers(article_id, reference_response, supplier_id, article_number_from_data)
+        
+        # CLIENT REQUIREMENT: Get accessory list for this article
+        print(f"\n📦 Fetching accessory list for article {article_id}...")
+        accessory_response = self.get_article_accessory_list(article_id)
+        if accessory_response:
+            self.process_accessory_list(article_id, accessory_response)
+        else:
+            print(f"   ⚠ No accessories found for article {article_id}")
     
     def extract_specific_gtin(self, article_id: int, article: Dict[str, Any], target_gtin: str) -> bool:
         """Extract only a specific GTIN/EAN from article data
@@ -1184,6 +1243,9 @@ class TecdocClient:
         # Extract mfrId
         mfr_id = str(article.get('mfrId', ''))
         
+        # Extract additionalDescription (CLIENT REQUIREMENT: e.g., "EASY FIT")
+        additional_description = article.get('additionalDescription', '')
+        
         # Create article row according to schema
         article_row = {
             'article_id': legacy_article_id,  # Using legacyArticleId as article_id
@@ -1197,6 +1259,7 @@ class TecdocClient:
             'category_node_ids': category_node_ids,  # Built from assemblyGroupFacets hierarchy
             'short_description': '',  # Missing field - set as empty
             'note': '',  # Missing field - set as empty
+            'additional_description': additional_description,  # CLIENT REQUIREMENT: e.g., "EASY FIT", "Chempioil Ultra XTT 5W-40"
             'image_urls': '|'.join(image_urls_3200),  # 3200px images sorted by sortNumber, pipe-delimited
             'pdf_urls': '|'.join(pdf_urls),
             'is_accessory': is_accessory,  # Using isAccessory from misc
@@ -1514,67 +1577,106 @@ class TecdocClient:
                 self.csv_data['article_relations'].append(relation_row)
     
     def process_brand_data(self, supplier_id: int, brand_name: str) -> None:
-        """Process data for brands.csv"""
+        """Process data for brands.csv (CLIENT REQUIREMENT)
+        
+        Uses getBrands API to extract:
+        - Basic info: dataSupplierId, mfrName
+        - Address details (type 1 = general, type 17 = GPSR)
+        - Logo URLs (100px, 200px, 400px, 800px)
+        - Excludes: dataSupplierStatus (per client request)
+        """
         # Check if brand already processed
         for existing_brand in self.csv_data['brands']:
             if existing_brand['supplier_id'] == supplier_id:
                 return  # Already processed
         
-        # Get brand info
+        # Get brand info using getBrands API
         brand_response = self.get_brand_info(supplier_id)
         
+        # Initialize brand row with defaults
         brand_row = {
             'supplier_id': supplier_id,
             'brand_name': brand_name,
-            'www_url': '',
-            'email': '',
-            'phone': '',
-            'fax': '',
-            'status': '',
-            'status_badge_url': '',
+            'general_name': '',
+            'general_name2': '',
+            'general_street': '',
+            'general_zip': '',
+            'general_city': '',
+            'general_country_iso': '',
+            'general_mailbox': '',
+            'general_zip_mailbox': '',
+            'general_phone': '',
+            'general_fax': '',
+            'general_email': '',
+            'general_www_url': '',
+            'gpsr_name': '',
+            'gpsr_street': '',
+            'gpsr_zip': '',
+            'gpsr_city': '',
+            'gpsr_country_iso': '',
+            'gpsr_mailbox': '',
+            'gpsr_phone': '',
+            'gpsr_fax': '',
+            'gpsr_email': '',
+            'gpsr_www_url': '',
             'logo_url_100': '',
             'logo_url_200': '',
             'logo_url_400': '',
-            'logo_url_800': '',
-            'zip_country_iso': '',
-            'city': '',
-            'zip': '',
-            'street': '',
-            'name': '',
-            'name2': ''
+            'logo_url_800': ''
         }
         
+        # Parse response: data.array[0]
         if brand_response and 'data' in brand_response:
-            brand_data = brand_response.get('data', {})
-            brand_row.update({
-                'www_url': brand_data.get('website', ''),
-                'email': brand_data.get('email', ''),
-                'phone': brand_data.get('phone', ''),
-                'fax': brand_data.get('fax', ''),
-                'status': brand_data.get('status', ''),
-                'status_badge_url': brand_data.get('statusBadgeUrl', ''),
-                'zip_country_iso': brand_data.get('countryIso', ''),
-                'city': brand_data.get('city', ''),
-                'zip': brand_data.get('zip', ''),
-                'street': brand_data.get('street', ''),
-                'name': brand_data.get('companyName', ''),
-                'name2': brand_data.get('companyName2', '')
-            })
-            
-            # Extract logo URLs
-            if 'logos' in brand_data:
-                logos = brand_data['logos']
-                for logo in logos:
-                    if '100' in logo:
-                        brand_row['logo_url_100'] = logo['100']
-                    if '200' in logo:
-                        brand_row['logo_url_200'] = logo['200']
-                    if '400' in logo:
-                        brand_row['logo_url_400'] = logo['400']
-                    if '800' in logo:
-                        brand_row['logo_url_800'] = logo['800']
+            data = brand_response.get('data', {})
+            if 'array' in data and len(data['array']) > 0:
+                brand_data = data['array'][0]
+                
+                # Extract mfrName
+                brand_row['brand_name'] = brand_data.get('mfrName', brand_name)
+                
+                # Extract addressDetails array
+                if 'addressDetails' in brand_data:
+                    for address in brand_data['addressDetails']:
+                        address_type = address.get('addressType')
+                        
+                        # Type 1 = General address
+                        if address_type == 1:
+                            brand_row['general_name'] = address.get('name', '')
+                            brand_row['general_name2'] = address.get('name2', '')
+                            brand_row['general_street'] = address.get('street', '')
+                            brand_row['general_zip'] = address.get('zip', '')
+                            brand_row['general_city'] = address.get('city', '')
+                            brand_row['general_country_iso'] = address.get('zipCountryCodeISO', '')
+                            brand_row['general_mailbox'] = address.get('mailbox', '')
+                            brand_row['general_zip_mailbox'] = address.get('zipMailbox', '')
+                            brand_row['general_phone'] = address.get('phone', '')
+                            brand_row['general_fax'] = address.get('fax', '')
+                            brand_row['general_email'] = address.get('email', '')
+                            brand_row['general_www_url'] = address.get('wwwURL', '')
+                        
+                        # Type 17 = GPSR (Product Safety Regulation)
+                        elif address_type == 17:
+                            brand_row['gpsr_name'] = address.get('name', '')
+                            brand_row['gpsr_street'] = address.get('street', '')
+                            brand_row['gpsr_zip'] = address.get('zip', '')
+                            brand_row['gpsr_city'] = address.get('city', '')
+                            brand_row['gpsr_country_iso'] = address.get('zipCountryCodeISO', '')
+                            brand_row['gpsr_mailbox'] = address.get('mailbox', '')
+                            brand_row['gpsr_phone'] = address.get('phone', '')
+                            brand_row['gpsr_fax'] = address.get('fax', '')
+                            brand_row['gpsr_email'] = address.get('email', '')
+                            brand_row['gpsr_www_url'] = address.get('wwwURL', '')
+                
+                # Extract dataSupplierLogo
+                if 'dataSupplierLogo' in brand_data:
+                    logo = brand_data['dataSupplierLogo']
+                    brand_row['logo_url_100'] = logo.get('imageURL100', '')
+                    brand_row['logo_url_200'] = logo.get('imageURL200', '')
+                    brand_row['logo_url_400'] = logo.get('imageURL400', '')
+                    brand_row['logo_url_800'] = logo.get('imageURL800', '')
         
         self.csv_data['brands'].append(brand_row)
+        print(f"   ✓ Processed brand data for {brand_row['brand_name']}")
     
     def _format_year_month(self, date_value: Any) -> str:
         """Format date to YYYY-MM format
@@ -1602,6 +1704,92 @@ class TecdocClient:
             return f"{date_str}-01"
         
         return date_str
+    
+    def process_accessory_list(self, article_id: int, accessory_response: Dict[str, Any]) -> None:
+        """Process accessory list data and add to attributes CSV (CLIENT REQUIREMENT)
+        
+        Extracts accessory relationships and stores them as attribute entries.
+        Each accessory becomes a row in attributes.csv with type "Accessory".
+        
+        Args:
+            article_id: The main article ID
+            accessory_response: API response from getArticleAccessoryList4
+        """
+        if not accessory_response or 'data' not in accessory_response:
+            print(f"   ⚠ No accessory data to process")
+            return
+        
+        data = accessory_response.get('data', {})
+        
+        # Handle both dict with 'array' and direct list
+        if isinstance(data, dict) and 'array' in data:
+            accessories = data['array']
+        elif isinstance(data, list):
+            accessories = data
+        else:
+            print(f"   ⚠ Unexpected data format for accessories")
+            return
+        
+        if not accessories:
+            print(f"   ⚠ No accessories in response")
+            return
+        
+        print(f"   Processing {len(accessories)} accessories...")
+        
+        accessory_count = 0
+        for idx, item in enumerate(accessories):
+            if not isinstance(item, dict):
+                continue
+            
+            # Extract accessory details
+            details = item.get('accessoryDetails', {})
+            if not details:
+                continue
+            
+            # Extract key fields
+            accessory_article_id = details.get('accessoryArticleId', '')
+            accessory_link_id = details.get('accessoryLinkId', '')
+            article_name = details.get('articleName', '')
+            article_no = details.get('articleNo', '')
+            brand_name = details.get('brandName', '')
+            brand_no = details.get('brandNo', '')
+            generic_article_name = details.get('genericArticleName', '')
+            quantity = details.get('quantity', '')
+            
+            # Build attribute value with all relevant information
+            value_parts = []
+            if article_no:
+                value_parts.append(f"Article: {article_no}")
+            if brand_name:
+                value_parts.append(f"Brand: {brand_name}")
+            if generic_article_name and generic_article_name != article_name:
+                value_parts.append(f"Type: {generic_article_name}")
+            if quantity:
+                value_parts.append(f"Qty: {quantity}")
+            if accessory_article_id:
+                value_parts.append(f"ID: {accessory_article_id}")
+            
+            attribute_value = ' | '.join(value_parts) if value_parts else ''
+            
+            # Create attribute row for accessories
+            # Using the existing attributes CSV structure
+            accessory_row = {
+                'article_id': article_id,
+                'criteria_id': f'accessory_{accessory_link_id}' if accessory_link_id else f'accessory_{idx+1}',
+                'criteria_description': 'Accessory',
+                'criteria_abbr': 'ACC',
+                'value_raw': article_name,
+                'value_formatted': attribute_value,
+                'unit': '',
+                'immediate_display': 'true',
+                'is_interval': 'false'
+            }
+            
+            self.csv_data['attributes'].append(accessory_row)
+            accessory_count += 1
+            print(f"   ✓ Added accessory: {article_name} ({article_no})")
+        
+        print(f"   ✓ Processed {accessory_count} accessories into attributes.csv")
     
     def process_vehicle_linkages(self, article_id: int, linkages_response: Dict[str, Any], linkage_pairs_map: Dict[int, int] = None) -> None:
         """Process vehicle linkages for vehicles.csv
@@ -2023,7 +2211,7 @@ class TecdocClient:
         articles_columns = [
             'article_id', 'supplier_id', 'mfr_id', 'brand_name', 'article_number',
             'generic_article_id', 'generic_article_description', 'category_path',
-            'category_node_ids', 'short_description', 'note',
+            'category_node_ids', 'short_description', 'note', 'additional_description',
             'image_urls', 'pdf_urls', 'is_accessory', 'article_status_id', 'article_status_description',
             'article_status_valid_from_date', 'quantity_per_package', 'quantity_per_part_per_package',
             'is_self_service_packing', 'has_mandatory_material_certification', 'is_remanufactured_part'
@@ -2189,6 +2377,46 @@ class TecdocClient:
             print(f"ERROR: Error creating vehicles.csv: {e}")
             return ""
     
+    def export_brands_csv(self, filename: str = None) -> str:
+        """Export brands data to CSV file (CLIENT REQUIREMENT)"""
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"brands_{timestamp}.csv"
+        
+        # Define brands CSV schema
+        brands_columns = [
+            'supplier_id', 'brand_name',
+            'general_name', 'general_name2', 'general_street', 'general_zip',
+            'general_city', 'general_country_iso', 'general_mailbox', 'general_zip_mailbox',
+            'general_phone', 'general_fax', 'general_email', 'general_www_url',
+            'gpsr_name', 'gpsr_street', 'gpsr_zip', 'gpsr_city',
+            'gpsr_country_iso', 'gpsr_mailbox', 'gpsr_phone', 'gpsr_fax',
+            'gpsr_email', 'gpsr_www_url',
+            'logo_url_100', 'logo_url_200', 'logo_url_400', 'logo_url_800'
+        ]
+        
+        data = self.csv_data['brands']
+        
+        if not data:
+            print("WARNING: No brands data to export")
+            return ""
+        
+        try:
+            df = pd.DataFrame(data)
+            df = df.reindex(columns=brands_columns, fill_value='')
+            
+            # Export with semicolon delimiter as per client requirements
+            df.to_csv(filename, index=False, encoding='utf-8', sep=';')
+            
+            print(f"SUCCESS: brands.csv created: {len(data)} records")
+            print(f"File: {filename}")
+            
+            return filename
+            
+        except Exception as e:
+            print(f"ERROR: Error creating brands.csv: {e}")
+            return ""
+    
     def export_to_csv(self, data: List[Dict[str, Any]], filename: str = None) -> str:
         """Export data to CSV"""
         if not filename:
@@ -2260,6 +2488,28 @@ def main():
     for idx, (mfr_id, art_num) in enumerate(ARTICLES_TO_PROCESS, 1):
         print(f"   {idx}. Manufacturer {mfr_id}, Article {art_num}")
     print()
+    
+    # CLIENT REQUIREMENT: Collect unique manufacturers for brands.csv
+    unique_manufacturers = set()
+    for manufacturer_id, article_number in ARTICLES_TO_PROCESS:
+        unique_manufacturers.add(manufacturer_id)
+    
+    # Process brand data for each unique manufacturer
+    print(f"\n{'='*50}")
+    print(f"Processing brand data for {len(unique_manufacturers)} manufacturers...")
+    print(f"{'='*50}")
+    
+    manufacturer_names = {
+        355: "DT Spare Parts",
+        205: "NRF",
+        80: "AKS Dasis",
+        101: "FEBI BILSTEIN"
+    }
+    
+    for manufacturer_id in sorted(unique_manufacturers):
+        manufacturer_name = manufacturer_names.get(manufacturer_id, f"Manufacturer {manufacturer_id}")
+        print(f"\n📦 Processing brand: {manufacturer_name} (ID: {manufacturer_id})")
+        client.process_brand_data(manufacturer_id, manufacturer_name)
     
     # Loop through all articles to process
     for article_index, (manufacturer_id, article_number) in enumerate(ARTICLES_TO_PROCESS, 1):
@@ -2424,6 +2674,10 @@ def main():
     print(f"\nExporting to vehicles.csv...")
     created_vehicles_file = client.export_vehicles_csv()
     
+    # Step 8: Export to brands.csv
+    print(f"\nExporting to brands.csv...")
+    created_brands_file = client.export_brands_csv()
+    
     if created_file:
         print(f"\n" + "="*50)
         print(f"Export completed successfully!")
@@ -2440,6 +2694,9 @@ def main():
             file_num += 1
         if created_vehicles_file:
             print(f"   {file_num}. {created_vehicles_file}")
+            file_num += 1
+        if created_brands_file:
+            print(f"   {file_num}. {created_brands_file}")
         
         # Show summary of articles data
         articles_data = client.csv_data['articles']

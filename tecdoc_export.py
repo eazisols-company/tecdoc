@@ -14,7 +14,7 @@ from datetime import datetime
 import pandas as pd
 
 # Configuration
-TECDOC_API_KEY = "2BeBXg6R9LRdWoHtCcfhS8EB74TpK7uQn3nejjYmbpK2WDnwE7Kq"
+#TECDOC_API_KEY = "Test_2BeBXg6R9LRdWoHtCcfhS8EB74TpK7uQn3nejjYmbpK2WDnwE7Kq987lop"
 TECDOC_BASE_URL = "https://webservice.tecalliance.services/pegasus-3-0/services/TecdocToCatDLB.jsonEndpoint"
 TECDOC_PROVIDER = 25183
 
